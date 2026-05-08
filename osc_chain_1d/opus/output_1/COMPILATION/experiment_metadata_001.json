@@ -1,0 +1,20 @@
+{
+  "iteration": 1,
+  "input_tokens": 14833,
+  "output_tokens": 34710,
+  "request_count": 1,
+  "generation_time_s": 509.209,
+  "build_status": false,
+  "run_status": false,
+  "overall_status": "BUILD_FAIL",
+  "per_file_status": {
+    "odeint.txt": "BUILD_FAIL"
+  },
+  "build_dictionary": {
+    "build_returncode": 2,
+    "build_stdout": "-- The CXX compiler identification is GNU 14.3.0\n-- Detecting CXX compiler ABI info\n-- Detecting CXX compiler ABI info - done\n-- Check for working CXX compiler: /gridapps/software/GCCcore/14.3.0/bin/c++ - skipped\n-- Detecting CXX compile features\n-- Detecting CXX compile features - done\n-- Using Legion_DIR from environment: /Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/share/Legion/cmake\n-- Found ZLIB: /gridapps/software/zlib/1.3.1-GCCcore-14.3.0/lib/libz.so (found version \"1.3.1\")\n-- Found Legion: /Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/share/Legion/cmake\n-- Found Boost: /Users/robsonlab/Teetly/hpx/boost_1_64_0/install/include (found version \"1.64.0\")\n-- Configuring done (1.1s)\n-- Generating done (0.0s)\n-- Build files have been written to: /tmp/tmpuzalh2xw/build\n[ 50%] Building CXX object CMakeFiles/odeint.dir/odeint.cpp.o\n",
+    "build_stderr": "CMake Warning (dev) at CMakeLists.txt:23 (find_package):\n  Policy CMP0167 is not set: The FindBoost module is removed.  Run \"cmake\n  --help-policy CMP0167\" for policy details.  Use the cmake_policy command to\n  set the policy and suppress this warning.\n\nThis warning is for project developers.  Use -Wno-dev to suppress it.\n\nCMake Warning (dev) at /gridapps/software/CMake/4.0.3-GCCcore-14.3.0/share/cmake-4.0/Modules/FindBoost.cmake:609 (find_package):\n  Policy CMP0144 is not set: find_package uses upper-case <PACKAGENAME>_ROOT\n  variables.  Run \"cmake --help-policy CMP0144\" for policy details.  Use the\n  cmake_policy command to set the policy and suppress this warning.\n\n  Environment variable BOOST_ROOT is set to:\n\n    /Users/robsonlab/Teetly/hpx/boost_1_64_0/install\n\n  For compatibility, find_package is ignoring the variable, but code in a\n  .cmake module might still use it.\nCall Stack (most recent call first):\n  CMakeLists.txt:23 (find_package)\nThis warning is for project developers.  Use -Wno-dev to suppress it.\n\n/tmp/tmpuzalh2xw/odeint.cpp: In function \u2018void top_level_task(const Legion::Task*, const std::vector<Legion::PhysicalRegion>&, Legion::Context, Legion::Runtime*)\u2019:\n/tmp/tmpuzalh2xw/odeint.cpp:317:64: error: call of overloaded \u2018get_logical_subregion_by_color(Legion::Internal::TaskContext*&, Legion::LogicalPartition&, Legion::Point<1, long long int>)\u2019 is ambiguous\n  317 |                         runtime->get_logical_subregion_by_color(ctx, dpdt_lp,\n      |                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~\n  318 |                             Point<1>((coord_t)i));\n      |                             ~~~~~~~~~~~~~~~~~~~~~               \nIn file included from /tmp/tmpuzalh2xw/odeint.cpp:4:\n/Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/include/legion.h:7072:21: note: candidate: \u2018Legion::LogicalRegion Legion::Runtime::get_logical_subregion_by_color(Legion::Context, Legion::LogicalPartition, Legion::Color)\u2019\n 7072 |       LogicalRegion get_logical_subregion_by_color(Context ctx,\n      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n/Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/include/legion.h:7075:21: note: candidate: \u2018Legion::LogicalRegion Legion::Runtime::get_logical_subregion_by_color(Legion::Context, Legion::LogicalPartition, const Legion::DomainPoint&)\u2019\n 7075 |       LogicalRegion get_logical_subregion_by_color(Context ctx,\n      |                     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nmake[2]: *** [CMakeFiles/odeint.dir/build.make:79: CMakeFiles/odeint.dir/odeint.cpp.o] Error 1\nmake[1]: *** [CMakeFiles/Makefile2:87: CMakeFiles/odeint.dir/all] Error 2\nmake: *** [Makefile:91: all] Error 2\n"
+  },
+  "run_dictionary": null,
+  "output_files_content": {}
+}

@@ -1,0 +1,919 @@
+[Makefile]
+```make
+CXX ?= g++
+
+CXXFLAGS += -std=c++17 -O2 -g -I. -pthread
+LDFLAGS += -pthread
+
+PROGRAMS := binary_tree unit_tests concurrency_tests
+BUILD_DIR := build
+
+.PHONY: all clean directories
+all: directories $(addprefix $(BUILD_DIR)/,$(PROGRAMS))
+
+directories: $(BUILD_DIR)
+
+$(BUILD_DIR):
+	mkdir -p $@
+
+$(BUILD_DIR)/%: %.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)
+
+clean:
+	rm -rf $(BUILD_DIR)
+```
+
+[ReadMe.md]
+````markdown
+# ASTM (Asynchronous Software Transaction Memory)
+
+A header-only Software Transactional Memory (STM) library built on Legion. ASTM provides optimistic concurrency control for shared variables and features such as:
+
+Transaction manager:
+    - Provides transaction-local storage
+    - Implement the four basic operations which occur in transactions: read, write, async, commit 
+
+## Programs
+binary_tree
+Example implementation of an unbalanced binary tree implemented using ASTM, with values that have side-effecting constructors. Each non-empty node has astm::new to allocate its value so there are no dependencies, and abstracts programmers away from performing explicit reads and writes through the use of smart pointer syntax. Results are written to binary_tree.txt.
+
+unit_tests
+Unit tests covering core STM operations: read/write ordering, overwrites, arithmetic with local variables, future-based reads, and transaction retry logic on conflict. Results are written to unit_tests.txt.
+
+concurrency_tests
+Concurrency stress tests verifying atomicity under contention, including threads incrementing a shared integer and squaring transactions. Results are written to concurrency_test.txt. 
+
+## Prerequisites 
+
+- Legion installed
+- A C++17-compliant C++ compiler (e.g. GCC, Clang) and beyond
+- Boost, which path is set as `BOOST_ROOT` and incorporated into `LD_LIBRARY_PATH`
+
+### Build
+-----------------
+Repository depends on Legion 25.06.0
+
+Make sure to set $LEGION_ROOT to Legion install directory 
+
+```
+make
+```
+
+If you would like to rebulid, run  ```make clean``` before running ```make``` again. 
+
+### Run
+The program produces three executables:
+    - ```binary_tree``` from binary_tree.cpp , outputs  binary_tree.txt
+    - ```unit_tests``` from unit_tests.cpp, outputs unit_tests.txt
+    - ```concurrency_tests``` from concurrency_tests.cpp, outputs concurrency_test.txt
+
+```
+````
+
+[astm.hpp]
+```cpp
+////////////////////////////////////////////////////////////////////////////////
+//  Copyright (c) 2014 Bryce Adelstein-Lelbach
+//  Copyright (c) 2014 Steve Brandt
+//
+//  Distributed under the Boost Software License, Version 1.0. (See accompanying
+//  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+////////////////////////////////////////////////////////////////////////////////
+
+#if !defined(ASTM_DBA88345_57B8_4CC8_A574_D5F007250E94)
+#define ASTM_DBA88345_57B8_4CC8_A574_D5F007250E94
+
+#include "astm_config.hpp"
+
+#include <cassert>
+#include <list>
+#include <map>
+#include <memory>
+#include <set>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+namespace astm
+{
+
+struct transaction;
+
+struct shared_var_base
+{
+    virtual ~shared_var_base() {}
+
+    virtual shared_var_base* clone() const = 0;
+    virtual void write(shared_var_base const&) = 0;
+    virtual ASTM_LOCK lock() const = 0;
+    virtual bool operator==(shared_var_base const&) const = 0;
+};
+
+namespace detail
+{
+    using continuation_fn = ASTM_FUNCTION<void(transaction*)>;
+
+    template <typename>
+    inline constexpr bool always_false_v = false;
+
+    template <typename F>
+    continuation_fn make_continuation(F&& f)
+    {
+        using Fn = std::decay_t<F>;
+        return [fn = Fn(std::forward<F>(f))](transaction* t) mutable {
+            if constexpr (std::is_invocable_v<Fn&, transaction*>)
+            {
+                fn(t);
+            }
+            else if constexpr (std::is_invocable_v<Fn&>)
+            {
+                fn();
+            }
+            else
+            {
+                static_assert(always_false_v<Fn>,
+                    "Continuation must be callable with (transaction*) or with no arguments");
+            }
+        };
+    }
+
+    struct async_handle
+    {
+        std::shared_future<void> fut;
+
+        async_handle() = default;
+
+        explicit async_handle(std::future<void>&& f)
+          : fut(f.share())
+        {}
+
+        void wait()
+        {
+            if (fut.valid()) fut.wait();
+        }
+    };
+
+    struct continuation_future
+    {
+        std::vector<async_handle> handles;
+
+        void add(async_handle h)
+        {
+            handles.push_back(std::move(h));
+        }
+
+        void get()
+        {
+            for (auto& h : handles)
+                h.wait();
+            handles.clear();
+        }
+    };
+
+    inline async_handle spawn_tracked(continuation_fn fn, transaction* trans)
+    {
+        return async_handle(std::async(
+            std::launch::async,
+            [op = std::move(fn), trans]() mutable { op(trans); }));
+    }
+
+    inline void spawn_detached(continuation_fn fn, transaction* trans)
+    {
+        std::thread([op = std::move(fn), trans]() mutable { op(trans); }).detach();
+    }
+
+} // namespace detail
+
+template <typename RuntimeT, typename ContextT>
+inline void bind_legion_runtime(RuntimeT*, ContextT)
+{
+}
+
+inline void unbind_legion_runtime()
+{
+}
+
+struct transaction_future
+{
+    using future_type = detail::continuation_future;
+
+  private:
+    transaction* trans_;
+    future_type fut_;
+
+  public:
+    explicit transaction_future(transaction* trans)
+      : trans_(trans)
+      , fut_()
+    {}
+
+    explicit transaction_future(transaction& trans)
+      : trans_(&trans)
+      , fut_()
+    {}
+
+    template <typename F>
+    void then(F f);
+
+    void get()
+    {
+        fut_.get();
+    }
+};
+
+template <typename T>
+struct shared_var : shared_var_base
+{
+    using future_type = detail::continuation_future;
+
+    struct local_var
+    {
+      private:
+        transaction* trans_;
+        shared_var_base* var_;
+
+      public:
+        local_var(transaction* trans, shared_var_base* var)
+          : trans_(trans)
+          , var_(var)
+        {}
+
+        T get() const;
+
+        operator T() const;
+
+        local_var& operator=(shared_var_base const& rhs);
+
+        local_var& operator=(T const& rhs);
+
+        template <typename F>
+        void then(F f);
+    };
+
+  private:
+    T data_;
+    mutable ASTM_MUTEX mtx_;
+
+  public:
+    future_type queue;
+
+    shared_var()
+      : data_()
+      , mtx_()
+      , queue()
+    {}
+
+    explicit shared_var(T const& t)
+      : data_(t)
+      , mtx_()
+      , queue()
+    {}
+
+    explicit shared_var(T&& t)
+      : data_(std::move(t))
+      , mtx_()
+      , queue()
+    {}
+
+    shared_var(shared_var const& rhs)
+      : data_(rhs.read())
+      , mtx_()
+      , queue()
+    {}
+
+    ~shared_var() {}
+
+    shared_var_base* clone() const override
+    {
+        ASTM_LOCK l(mtx_);
+        return new shared_var(data_);
+    }
+
+    T read() const
+    {
+        ASTM_LOCK l(mtx_);
+        return data_;
+    }
+
+    void write(T const& rhs)
+    {
+        ASTM_LOCK l(mtx_);
+        data_ = rhs;
+    }
+
+    void write(shared_var_base const& rhs) override
+    {
+        auto const* typed = dynamic_cast<shared_var const*>(&rhs);
+        assert(typed != nullptr);
+        data_ = typed->read();
+    }
+
+    ASTM_LOCK lock() const override
+    {
+        return ASTM_LOCK(mtx_);
+    }
+
+    bool operator==(shared_var_base const& rhs) const override
+    {
+        auto const* typed = dynamic_cast<shared_var const*>(&rhs);
+        assert(typed != nullptr);
+        return data_ == typed->read();
+    }
+
+    local_var get_local(transaction& trans)
+    {
+        return local_var(&trans, this);
+    }
+};
+
+struct transaction
+{
+    using future_type = detail::continuation_future;
+    using continuation_fn = detail::continuation_fn;
+
+    std::list<
+        std::pair<
+            shared_var_base*,
+            std::shared_ptr<shared_var_base>>>
+        read_list;
+
+    std::set<shared_var_base*> write_set;
+
+    std::list<
+        std::pair<
+            future_type*,
+            continuation_fn>>
+        async_list;
+
+    std::map<
+        shared_var_base*,
+        std::shared_ptr<shared_var_base>>
+        variables;
+
+    void clear()
+    {
+        read_list.clear();
+        write_set.clear();
+        async_list.clear();
+        variables.clear();
+    }
+
+    bool commit_transaction()
+    {
+        std::list<ASTM_LOCK> locks;
+
+        for (auto const& var : variables)
+        {
+            assert(var.first != nullptr);
+            locks.push_back(var.first->lock());
+        }
+
+        for (auto const& var : read_list)
+        {
+            assert(var.first != nullptr);
+            if (!((*var.first) == (*var.second)))
+            {
+                clear();
+                return false;
+            }
+        }
+
+        for (shared_var_base* var : write_set)
+        {
+            assert(var != nullptr);
+            auto it = variables.find(var);
+            assert(it != variables.end());
+            (*var).write(*((*it).second));
+        }
+
+        for (auto& op : async_list)
+        {
+            if (op.first == nullptr)
+            {
+                detail::spawn_detached(op.second, this);
+            }
+            else
+            {
+                op.first->add(detail::spawn_tracked(op.second, this));
+            }
+        }
+
+        return true;
+    }
+
+    shared_var_base const& read(shared_var_base* var)
+    {
+        assert(var != nullptr);
+
+        std::pair<shared_var_base*, std::shared_ptr<shared_var_base>> entry(var, nullptr);
+        auto result = variables.insert(entry);
+
+        if (result.second == true)
+        {
+            result.first->second.reset(var->clone());
+            read_list.push_back(*result.first);
+            return *(result.first->second);
+        }
+
+        return *(result.first->second);
+    }
+
+    void write(shared_var_base* var, shared_var_base const& value)
+    {
+        assert(var != nullptr);
+
+        std::pair<shared_var_base*, std::shared_ptr<shared_var_base>> entry(
+            var, std::shared_ptr<shared_var_base>(value.clone()));
+
+        auto result = variables.insert(entry);
+
+        if (result.second == true)
+        {
+            write_set.insert(var);
+        }
+        else
+        {
+            result.first->second = entry.second;
+            write_set.insert(var);
+        }
+    }
+
+    void then(future_type* fut, continuation_fn F)
+    {
+        async_list.emplace_back(fut, std::move(F));
+    }
+};
+
+template <typename T>
+shared_var<T>::local_var::operator T() const
+{
+    return dynamic_cast<shared_var const*>(&trans_->read(var_))->read();
+}
+
+template <typename T>
+T shared_var<T>::local_var::get() const
+{
+    return dynamic_cast<shared_var const*>(&trans_->read(var_))->read();
+}
+
+template <typename T>
+typename shared_var<T>::local_var&
+shared_var<T>::local_var::operator=(shared_var_base const& rhs)
+{
+    trans_->write(var_, rhs);
+    return *this;
+}
+
+template <typename T>
+typename shared_var<T>::local_var&
+shared_var<T>::local_var::operator=(T const& rhs)
+{
+    shared_var tmp(rhs);
+    trans_->write(var_, tmp);
+    return *this;
+}
+
+template <typename T>
+template <typename F>
+void shared_var<T>::local_var::then(F f)
+{
+    assert(trans_ != nullptr);
+    auto* concrete = dynamic_cast<shared_var<T>*>(var_);
+    assert(concrete != nullptr);
+    trans_->then(&concrete->queue, detail::make_continuation(std::move(f)));
+}
+
+template <typename F>
+void transaction_future::then(F f)
+{
+    assert(trans_ != nullptr);
+    trans_->then(&fut_, detail::make_continuation(std::move(f)));
+}
+
+} // namespace astm
+
+#endif // ASTM_DBA88345_57B8_4CC8_A574_D5F007250E94
+```
+
+[astm_config.hpp]
+```cpp
+////////////////////////////////////////////////////////////////////////////////
+//  Copyright (c) 2014 Bryce Adelstein-Lelbach
+//  Copyright (c) 2014 Steve Brandt
+//
+//  Distributed under the Boost Software License, Version 1.0. (See accompanying
+//  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+////////////////////////////////////////////////////////////////////////////////
+
+#if !defined(ASTM_DBA88345_57B8_4CC8_A574_D5F007250E95)
+#define ASTM_DBA88345_57B8_4CC8_A574_D5F007250E95
+
+#include <cassert>
+#include <functional>
+#include <future>
+#include <mutex>
+#include <thread>
+
+namespace astm
+{
+    inline std::future<void> make_ready_future()
+    {
+        std::promise<void> p;
+        p.set_value();
+        return p.get_future();
+    }
+} // namespace astm
+
+#define ASTM_MUTEX std::mutex
+#define ASTM_LOCK std::unique_lock<ASTM_MUTEX>
+#define ASTM_FUTURE std::future
+#define ASTM_FUNCTION std::function
+#define ASTM_ASYNC std::async
+#define ASTM_MAKE_READY_FUTURE astm::make_ready_future()
+
+#define ASTM_TEST assert
+#define ASTM_REPORT 0
+
+#endif // ASTM_DBA88345_57B8_4CC8_A574_D5F007250E95
+```
+
+[binary_tree.cpp]
+```cpp
+////////////////////////////////////////////////////////////////////////////////
+//  Standalone binary tree example
+////////////////////////////////////////////////////////////////////////////////
+
+#include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
+
+template <typename Key, typename Value>
+struct binary_tree {
+  struct node {
+    Key key;
+    Value value;
+    node* left;
+    node* right;
+
+    node(Key k, Value const& v) : key(k), value(v), left(nullptr), right(nullptr) {}
+  };
+
+  node* root;
+
+  binary_tree() : root(nullptr) {}
+
+  ~binary_tree() { destroy(root); }
+
+  void insert(Key key, Value const& value) { insert_impl(root, key, value); }
+
+  node* search(Key key) const { return search_impl(root, key); }
+
+private:
+  static void insert_impl(node*& leaf, Key key, Value const& value) {
+    if (leaf == nullptr) {
+      leaf = new node(key, value);
+      return;
+    }
+
+    if (key < leaf->key)
+      insert_impl(leaf->left, key, value);
+    else
+      insert_impl(leaf->right, key, value);
+  }
+
+  static node* search_impl(node* leaf, Key key) {
+    if (leaf == nullptr) return nullptr;
+    if (key == leaf->key) return leaf;
+    if (key < leaf->key) return search_impl(leaf->left, key);
+    return search_impl(leaf->right, key);
+  }
+
+  static void destroy(node* n) {
+    if (!n) return;
+    destroy(n->left);
+    destroy(n->right);
+    delete n;
+  }
+};
+
+int main() {
+  std::ofstream outfile("binary_tree.txt");
+  if (!outfile.is_open()) {
+    std::cerr << "Failed to open binary_tree.txt for writing." << std::endl;
+    return 1;
+  }
+
+  binary_tree<int, std::string> tree;
+
+  struct DataEntry {
+    int id;
+    std::string val;
+  };
+
+  std::vector<DataEntry> data = {
+      {50, "Root Node"},
+      {30, "Left Child"},
+      {70, "Right Child"},
+      {20, "Left-Left Grandchild"},
+      {40, "Left-Right Grandchild"},
+      {60, "Right-Left Grandchild"},
+      {80, "Right-Right Grandchild"}};
+
+  outfile << "Inserting Data:\n";
+  for (const auto& entry : data) {
+    outfile << "  Insert(Key: " << entry.id << ", Value: \"" << entry.val << "\")" << std::endl;
+    tree.insert(entry.id, entry.val);
+  }
+  outfile << "\n";
+
+  outfile << "Running Search Tests:\n";
+  auto perform_search = [&](int search_key) {
+    outfile << "  Search(Key: " << search_key << ") -> ";
+    auto n = tree.search(search_key);
+    if (n != nullptr) {
+      outfile << "Found! Result Value: \"" << n->value << "\"\n";
+    } else {
+      outfile << "Not Found.\n";
+    }
+  };
+
+  perform_search(99);
+  perform_search(10);
+  perform_search(50);
+  perform_search(20);
+  perform_search(60);
+  perform_search(80);
+  perform_search(45);
+
+  outfile.close();
+  return 0;
+}
+```
+
+[concurrency_tests.cpp]
+```cpp
+////////////////////////////////////////////////////////////////////////////////
+//  Concurrency stress tests for ASTM
+////////////////////////////////////////////////////////////////////////////////
+
+#include <fstream>
+#include <iostream>
+#include <thread>
+#include <vector>
+
+#include "astm.hpp"
+
+using namespace astm;
+
+// A = A * A
+void square_transaction(shared_var<int>& A)
+{
+    transaction t;
+    do {
+        auto A_ = A.get_local(t);
+        A_ = A_ * A_;
+    } while (!t.commit_transaction());
+}
+
+// A = A + 1
+void increment_transaction(shared_var<int>& A)
+{
+    transaction t;
+    do {
+        auto A_ = A.get_local(t);
+        A_ = A_ + 1;
+    } while (!t.commit_transaction());
+}
+
+int main()
+{
+    std::ofstream outfile("concurrency_tests.txt");
+    if (!outfile.is_open()) {
+        std::cerr << "Failed to open concurrency_tests.txt" << std::endl;
+        return 1;
+    }
+
+    // ---------------------------------------------------------
+    // TEST 1: High Concurrency Increment
+    // Goal: Ensure 64 threads atomically increment a shared variable.
+    // ---------------------------------------------------------
+    {
+        outfile << "Concurrency Increment Test\n";
+        outfile << "  Initial Value: 0\n";
+        outfile << "  Threads: 64\n";
+        outfile << "  Operation: A = A + 1\n";
+
+        shared_var<int> A(0);
+
+        std::vector<std::thread> threads;
+        threads.reserve(64);
+        for (int i = 0; i < 64; ++i)
+            threads.emplace_back([&A]() { increment_transaction(A); });
+        for (auto& th : threads)
+            th.join();
+
+        int result = A.read();
+
+        outfile << "  Expected Result: 64\n";
+        outfile << "  Actual Result:   " << result << "\n";
+        outfile << "  Status: " << (result == 64 ? "PASS" : "FAIL") << "\n\n";
+    }
+
+    // ---------------------------------------------------------
+    // TEST 2: Exponential Growth (Squaring)
+    // 2 -> 4 -> 16 -> 256 -> 65536
+    // ---------------------------------------------------------
+    {
+        outfile << "Exponential Growth (Squaring) Test\n";
+        outfile << "  Initial Value: 2\n";
+        outfile << "  Threads: 4\n";
+        outfile << "  Operation: A = A * A\n";
+
+        shared_var<int> A(2);
+
+        std::vector<std::thread> threads;
+        threads.reserve(4);
+        for (int i = 0; i < 4; ++i)
+            threads.emplace_back([&A]() { square_transaction(A); });
+        for (auto& th : threads)
+            th.join();
+
+        int result = A.read();
+
+        outfile << "  Expected Result: 65536\n";
+        outfile << "  Actual Result:   " << result << "\n";
+        outfile << "  Status: " << (result == 65536 ? "PASS" : "FAIL") << "\n";
+    }
+
+    outfile.close();
+    return 0;
+}
+```
+
+[unit_tests.cpp]
+```cpp
+////////////////////////////////////////////////////////////////////////////////
+//  ASTM unit tests (standalone)
+////////////////////////////////////////////////////////////////////////////////
+
+#include <fstream>
+#include <iostream>
+
+#include "astm.hpp"
+
+using namespace astm;
+
+int main()
+{
+    std::ofstream outfile("unit_tests.txt");
+    if (!outfile.is_open()) {
+        std::cerr << "Could not open unit_tests.txt" << std::endl;
+        return 1;
+    }
+
+    { // Read A, Write A
+        shared_var<int> A(1);
+        transaction t;
+        do {
+            auto A_ = A.get_local(t);
+            A_ = 2;
+        } while (!t.commit_transaction());
+
+        outfile << "Test (Read A, Write A): A = " << A.read() << std::endl;
+    }
+
+    { // Write A, Read A
+        shared_var<int> A(1);
+
+        transaction t;
+        do {
+            auto A_ = A.get_local(t);
+            A_ = 2;
+        } while (!t.commit_transaction());
+
+        outfile << "Test (Write A, Read A): A = " << A.read() << std::endl;
+    }
+
+    { // Write A, Write A
+        shared_var<int> A(1);
+
+        transaction t;
+        do {
+            auto A_ = A.get_local(t);
+            ASTM_TEST(A_ == 1);
+            ASTM_TEST(A_ == 1);
+        } while (!t.commit_transaction());
+
+        outfile << "Test (Write A, Write A): A = " << A.read() << std::endl;
+    }
+
+    { // Write A, Write A (overwrite)
+        shared_var<int> A(1);
+
+        transaction t;
+        do {
+            auto A_ = A.get_local(t);
+            A_ = 2;
+            A_ = 2;
+        } while (!t.commit_transaction());
+
+        outfile << "Test (Overwrite): A = " << A.read() << std::endl;
+    }
+
+    { // Read A, Write A, Read A
+        shared_var<int> A(1);
+
+        transaction t;
+        do {
+            auto A_ = A.get_local(t);
+            A_ = 2;
+        } while (!t.commit_transaction());
+
+        outfile << "Test (Read -> Write -> Read): A = " << A.read() << std::endl;
+    }
+
+    { // Write A, Read A, Write A
+        shared_var<int> A(1);
+
+        transaction t;
+        do {
+            auto A_ = A.get_local(t);
+            A_ = 2;
+            A_ = 2;
+        } while (!t.commit_transaction());
+
+        outfile << "Test (Write -> Read -> Write): A = " << A.read() << std::endl;
+    }
+
+    { // Basic arithmetic with local_vars.
+        shared_var<int> A(4);
+        shared_var<int> B(1);
+
+        // atomic { A = A*A - B; }
+        transaction t;
+        do {
+            auto A_ = A.get_local(t);
+            auto B_ = B.get_local(t);
+
+            A_ = A_ * A_ - B_;
+        } while (!t.commit_transaction());
+
+        outfile << "Test (Arithmetic): A = " << A.read() << ", B = " << B.read() << std::endl;
+    }
+
+    { // Read A to future.
+        shared_var<int> A(4);
+        shared_var<int> B(1);
+
+        transaction t;
+        transaction_future IO(t);
+
+        do {
+            auto A_ = A.get_local(t);
+            auto B_ = B.get_local(t);
+
+            A_ = A_ * A_;
+
+            IO.then(
+                [local_A = int(A_)](transaction*) { ASTM_TEST(local_A == 16); }
+            );
+
+            A_ = A_ - B_;
+        } while (!t.commit_transaction());
+
+        IO.get();
+        outfile << "Test (Read A to Future): A = " << A.read() << ", B = " << B.read() << std::endl;
+    }
+
+    {
+        shared_var<int> A(4);
+
+        // atomic { A = A*A; }
+        bool fail = true;
+        int attempt_count = 0;
+        transaction t;
+        do {
+            ++attempt_count;
+
+            auto A_ = A.get_local(t);
+
+            int tmp = A_ * A_;
+
+            if (fail)
+            {
+                A.write(3);
+                fail = false;
+            }
+
+            A_ = tmp;
+        } while (!t.commit_transaction());
+
+        outfile << "Test (Retry Logic): A = " << A.read()
+                << ", Attempts = <ignored>" << std::endl;
+    }
+
+    outfile.close();
+    return 0;
+}
+```

@@ -1,0 +1,5 @@
+app,llm_name,iteration,n_outputs,total_input_tokens,total_output_tokens,total_generation_time_s,mean_input_tokens,mean_output_tokens
+osc_chain_1d,gpt-5.3-codex,1,20,200962,231270,3345.844,10048.1,11563.5
+osc_chain_1d,gpt-5.3-codex,2,20,383281,506776,7682.394,19164.05,25338.8
+osc_chain_1d,opus,1,20,327341,738046,11478.182999999999,16367.05,36902.3
+osc_chain_1d,opus,2,18,606401,1368071,21565.845,33688.944444444445,76003.94444444444

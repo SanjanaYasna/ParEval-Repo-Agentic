@@ -1,0 +1,53 @@
+CXX ?= g++
+
+# Try to discover Legion flags via CMake package discovery. If LEGION_DIR is
+# not set, fall back to default CMake search paths, then pkg-config, then -llegion.
+CMAKE_FIND_PACKAGE_BASE = cmake --find-package -DNAME=Legion -DCOMPILER_ID=GNU -DLANGUAGE=CXX
+ifdef LEGION_DIR
+CMAKE_PREFIX_ARG = -DCMAKE_PREFIX_PATH="$(LEGION_DIR)"
+else
+CMAKE_PREFIX_ARG =
+endif
+
+LEGION_CFLAGS := $(strip $(shell $(CMAKE_FIND_PACKAGE_BASE) -DMODE=COMPILE $(CMAKE_PREFIX_ARG) 2>/dev/null || true))
+LEGION_LIBS   := $(strip $(shell $(CMAKE_FIND_PACKAGE_BASE) -DMODE=LINK    $(CMAKE_PREFIX_ARG) 2>/dev/null || true))
+
+ifeq ($(LEGION_CFLAGS),)
+LEGION_CFLAGS := $(strip $(shell pkg-config --cflags legion 2>/dev/null || true))
+endif
+ifeq ($(LEGION_LIBS),)
+LEGION_LIBS := $(strip $(shell pkg-config --libs legion 2>/dev/null || true))
+endif
+ifeq ($(LEGION_LIBS),)
+LEGION_LIBS := -llegion
+endif
+
+ifdef BOOST_ROOT
+BOOST_INCLUDE := -I$(BOOST_ROOT)/include
+BOOST_LIB     := -L$(BOOST_ROOT)/lib -Wl,-rpath,$(BOOST_ROOT)/lib
+else
+BOOST_INCLUDE :=
+BOOST_LIB     :=
+endif
+
+CXXFLAGS += -std=c++17 -I. -g -DASTM_LEGION $(LEGION_CFLAGS) $(BOOST_INCLUDE)
+LDFLAGS  += $(LEGION_LIBS) $(BOOST_LIB)
+
+ADDITIONAL_SOURCES :=
+PROGRAMS := binary_tree unit_tests concurrency_tests
+DIRECTORIES := build
+
+all: directories $(PROGRAMS)
+
+.PHONY: all clean directories
+directories: $(DIRECTORIES)/
+
+$(DIRECTORIES)/:
+	mkdir -p $@
+
+%: %.cpp | directories
+	$(CXX) $(CXXFLAGS) $(ADDITIONAL_SOURCES) $< -o build/$@ $(LDFLAGS)
+	cp build/$@ $@
+
+clean:
+	rm -rf $(DIRECTORIES) $(PROGRAMS)

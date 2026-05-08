@@ -1,0 +1,22 @@
+{
+  "iteration": 1,
+  "input_tokens": 10699,
+  "output_tokens": 14408,
+  "request_count": 1,
+  "generation_time_s": 206.026,
+  "build_status": false,
+  "run_status": false,
+  "overall_status": "BUILD_FAIL",
+  "per_file_status": {
+    "binary_tree.txt": "BUILD_FAIL",
+    "concurrency_tests.txt": "BUILD_FAIL",
+    "unit_tests.txt": "BUILD_FAIL"
+  },
+  "build_dictionary": {
+    "build_returncode": 2,
+    "build_stdout": "mkdir -p build\ng++ -DASTM_LEGION -std=c++17 -I. -g -pthread  -I/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/include  binary_tree.cpp -o build/binary_tree -pthread  -L/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/lib -Wl,-rpath,/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/lib\n",
+    "build_stderr": "binary_tree.cpp: In function \u2018{anonymous}::SearchResult {anonymous}::search_task(const Legion::Task*, const std::vector<Legion::PhysicalRegion>&, Legion::Context, Legion::Runtime*)\u2019:\nbinary_tree.cpp:199:50: error: \u2018const class Legion::ArraySyntax::AccessorRefHelper<{anonymous}::FixedValue, LEGION_READ_PRIV>\u2019 has no member named \u2018data\u2019\n  199 |       std::strncpy(result.value, value_acc[pcur].data, VALUE_SIZE - 1);\n      |                                                  ^~~~\nmake: *** [Makefile:60: build/binary_tree] Error 1\n"
+  },
+  "run_dictionary": null,
+  "output_files_content": {}
+}

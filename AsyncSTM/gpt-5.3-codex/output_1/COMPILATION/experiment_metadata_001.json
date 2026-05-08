@@ -1,0 +1,22 @@
+{
+  "iteration": 1,
+  "input_tokens": 10589,
+  "output_tokens": 12339,
+  "request_count": 1,
+  "generation_time_s": 187.958,
+  "build_status": false,
+  "run_status": false,
+  "overall_status": "BUILD_FAIL",
+  "per_file_status": {
+    "binary_tree.txt": "BUILD_FAIL",
+    "concurrency_tests.txt": "BUILD_FAIL",
+    "unit_tests.txt": "BUILD_FAIL"
+  },
+  "build_dictionary": {
+    "build_returncode": 2,
+    "build_stdout": "mkdir -p build/\ng++ -std=c++17 -I. -O2 -g -pthread -I/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/include binary_tree.cpp -o build/binary_tree -pthread -L/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/lib -Wl,-rpath,/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/lib\ng++ -std=c++17 -I. -O2 -g -pthread -I/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/include  -pthread -L/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/lib -Wl,-rpath,/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/lib  binary_tree.cpp build/binary_tree   -o binary_tree\n",
+    "build_stderr": "/usr/bin/ld: build/binary_tree:(.rodata+0x0): multiple definition of `_IO_stdin_used'; /lib/x86_64-linux-gnu/crt1.o:(.rodata.cst4+0x0): first defined here\n/usr/bin/ld: build/binary_tree: in function `main':\n/tmp/tmp5507c1sm/binary_tree.cpp:68: multiple definition of `main'; /tmp/ccEz6sCs.o:/tmp/tmp5507c1sm/binary_tree.cpp:68: first defined here\n/usr/bin/ld: build/binary_tree: in function `data_start':\n(.data+0x8): multiple definition of `__dso_handle'; /gridapps/software/GCCcore/14.3.0/lib/gcc/x86_64-pc-linux-gnu/14.3.0/crtbegin.o:(.data+0x0): first defined here\n/usr/bin/ld: build/binary_tree: in function `_fini':\n(.fini+0x0): multiple definition of `_fini'; /lib/x86_64-linux-gnu/crti.o:(.fini+0x0): first defined here\n/usr/bin/ld: build/binary_tree: in function `_dl_relocate_static_pie':\n(.text+0x820): multiple definition of `_dl_relocate_static_pie'; /lib/x86_64-linux-gnu/crt1.o:(.text+0x30): first defined here\n/usr/bin/ld: build/binary_tree: in function `_start':\n(.text+0x7f0): multiple definition of `_start'; /lib/x86_64-linux-gnu/crt1.o:(.text+0x0): first defined here\n/usr/bin/ld: build/binary_tree: in function `_init':\n(.init+0x0): multiple definition of `_init'; /lib/x86_64-linux-gnu/crti.o:(.init+0x0): first defined here\n/usr/bin/ld: build/binary_tree: in function `data_start':\n(.data+0x0): multiple definition of `__data_start'; /lib/x86_64-linux-gnu/crt1.o:(.data+0x0): first defined here\n/usr/bin/ld: /gridapps/software/GCCcore/14.3.0/lib/gcc/x86_64-pc-linux-gnu/14.3.0/crtend.o:(.tm_clone_table+0x0): multiple definition of `__TMC_END__'; build/binary_tree:(.data+0x10): first defined here\n/usr/bin/ld: cannot use executable file 'build/binary_tree' as input to a link\ncollect2: error: ld returned 1 exit status\nmake: *** [<builtin>: binary_tree] Error 1\n"
+  },
+  "run_dictionary": null,
+  "output_files_content": {}
+}

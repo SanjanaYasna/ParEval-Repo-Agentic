@@ -1,0 +1,1307 @@
+Looking at the code, I traced through the integration logic carefully. The issue is in the stepper loop ordering. The code places the force evaluation *after* both the p and q updates within each stage, but the boost `symplectic_rkn_sb3a_mclachlan` stepper evaluates the force *before* the p-update (for stages l>0). While these seem equivalent when considering consecutive stages, the boundary behavior differs: the code's trailing force evaluation between steps is skipped for the last step, but the dpdt from the *previous* stage's force eval (which used q *before* the final a[5] position update) gets reused incorrectly at the start of the next step. The fix is to restructure the loop to match the boost implementation exactly.
+
+[CMakeLists.txt]
+```cmake
+cmake_minimum_required(VERSION 3.10 FATAL_ERROR)
+project(osc_1d CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w -O3")
+
+# Find Legion
+if(DEFINED ENV{Legion_DIR})
+    set(Legion_DIR "$ENV{Legion_DIR}")
+    message(STATUS "Using Legion_DIR from environment: $ENV{Legion_DIR}")
+endif()
+
+find_package(Legion REQUIRED)
+
+# Find Boost
+if(DEFINED ENV{BOOST_ROOT})
+    set(BOOST_ROOT "$ENV{BOOST_ROOT}")
+    message(STATUS "Using BOOST_ROOT from environment: $ENV{BOOST_ROOT}")
+endif()
+
+find_package(Boost REQUIRED)
+
+add_executable(odeint odeint.cpp)
+
+target_include_directories(odeint PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${Boost_INCLUDE_DIRS}
+)
+
+target_link_libraries(odeint
+    Legion::Legion
+    ${Boost_LIBRARIES}
+)
+```
+
+[ReadMe.md]
+```markdown
+# Legion Oscillator Chain (ODEINT)
+
+The program integrates a 1D nonlinear oscillator chain with:
+
+- On-site potential exponent: `KAPPA = 3.5`
+- Coupling exponent: `LAMBDA = 4.5`
+
+Time integration is performed using boost::numeric::odeint::symplectic_rkn_sb3a_mclachlan which is a stepper suitable for Hamiltonian systems. (https://www.boost.org/doc/libs/1_88_0/boost/numeric/odeint/stepper/symplectic_rkn_sb3a_mclachlan.hpp)
+All energy calculation outputs are written to ```odeint.txt```. The compiled program executable should be called ```odeint```.
+
+### Prerequisites
+
+- Legion installed
+- A C++17-compliant C++ compiler (e.g. GCC, Clang) and beyond
+- Boost, which path is set as `BOOST_ROOT` and incorporated into `LD_LIBRARY_PATH`
+
+### Build
+
+Repository depends on Legion 25.06.0
+
+Make sure to set $LEGION_ROOT to Legion install directory 
+
+```
+mkdir build; cd build
+
+cmake ..
+
+make
+```
+
+### Run
+-----------------
+The program is controlled by four command-line parameters:
+
+--N (int)
+Total dimension of the oscillator chain. Default 1024
+
+--G (int)
+Block size (number of elements per task, officially termed as 'dataflow' as this was a translation from HPX). Defult 128
+
+--steps (int)
+Number of time integration steps. Default 100
+
+--dt (double) 
+Time step size, default 0.01
+
+The energy computations should return a rounded integer results of the computation. 
+
+Example Run:
+```bash
+> ./odeint --N 2048 --dt 0.1
+> cat odeint.txt
+Dimension: 2048, number of elements per dataflow: 128, number of dataflow: 16, steps: 100, dt: 0.1
+Initialization complete, energy: 341
+Integration complete, energy: 341
+```
+```
+
+[algebra.hpp]
+```cpp
+// Copyright 2013 Mario Mulansky
+#ifndef SHARED_ALGEBRA_HPP
+#define SHARED_ALGEBRA_HPP
+
+#include <cstddef>
+
+struct local_dataflow_algebra
+{
+    template< typename S , typename Op >
+    void for_each3( S &s1 , const S &s2 , const S &s3 , Op op )
+    {
+        const size_t N = s1.size();
+        for( size_t i = 0 ; i < N ; ++i )
+        {
+            s1[i] = op( s1[i] , s2[i] , s3[i] );
+        }
+    }
+};
+
+#endif
+```
+
+[odeint.cpp]
+```cpp
+// Copyright 2013 Mario Mulansky
+// Translated from HPX to Legion execution model
+//
+#include <iostream>
+#include <vector>
+#include <memory>
+#include <fstream>
+#include <random>
+#include <cmath>
+#include <functional>
+#include <cstring>
+#include <cstdlib>
+
+#include "legion.h"
+
+#include <boost/math/special_functions/sign.hpp>
+
+using namespace Legion;
+
+// ---------------------------------------------------------------------------
+// Physical constants
+// ---------------------------------------------------------------------------
+const double KAPPA = 3.5;
+const double LAMBDA = 4.5;
+
+// ---------------------------------------------------------------------------
+// Stepper coefficients for symplectic_rkn_sb3a_mclachlan (6 stages, order 4)
+// Matches boost::numeric::odeint::symplectic_rkn_sb3a_mclachlan
+// ---------------------------------------------------------------------------
+static const int NUM_STAGES = 6;
+
+static const double COEF_A_0 =  0.40518861839525227722;
+static const double COEF_A_1 = -0.28714404081652408900;
+static const double COEF_A_2 =  0.5 - COEF_A_0 - COEF_A_1;
+
+static const double COEF_A[NUM_STAGES] = {
+    COEF_A_0, COEF_A_1, COEF_A_2, COEF_A_2, COEF_A_1, COEF_A_0
+};
+
+static const double COEF_B_0 = -3.0 / 73.0;
+static const double COEF_B_1 =  17.0 / 59.0;
+static const double COEF_B_2 =  1.0 - 2.0 * (COEF_B_0 + COEF_B_1);
+
+static const double COEF_B[NUM_STAGES] = {
+    COEF_B_0, COEF_B_1, COEF_B_2, COEF_B_1, COEF_B_0, 0.0
+};
+
+// ---------------------------------------------------------------------------
+// Task IDs
+// ---------------------------------------------------------------------------
+enum TaskIDs {
+    TOP_LEVEL_TASK_ID,
+    INIT_ZERO_TASK_ID,
+    INIT_COPY_TASK_ID,
+    SYSTEM_TASK_ID,
+    SCALE_SUM2_TASK_ID,
+    GET_FIRST_ELEM_TASK_ID,
+    GET_LAST_ELEM_TASK_ID,
+};
+
+// ---------------------------------------------------------------------------
+// Field IDs
+// ---------------------------------------------------------------------------
+enum FieldIDs {
+    FID_VAL = 0,
+};
+
+// ---------------------------------------------------------------------------
+// Math helpers (from system.hpp)
+// ---------------------------------------------------------------------------
+namespace checked_math {
+    inline double pow(double x, double y) {
+        if (x == 0.0) return 0.0;
+        return std::pow(std::abs(x), y);
+    }
+}
+
+inline double signed_pow(double x, double k) {
+    return checked_math::pow(x, k) * boost::math::sign(x);
+}
+
+// ---------------------------------------------------------------------------
+// Task argument structures
+// ---------------------------------------------------------------------------
+struct SystemArgs {
+    int block_idx;
+    int num_blocks;
+};
+
+struct ScaleSum2Args {
+    double alpha1;
+    double alpha2;
+};
+
+// ---------------------------------------------------------------------------
+// INIT_ZERO_TASK – fill a sub-region with zeros
+// ---------------------------------------------------------------------------
+void init_zero_task(const Task *task,
+                    const std::vector<PhysicalRegion> &regions,
+                    Context ctx, Runtime *runtime)
+{
+    const FieldAccessor<WRITE_DISCARD, double, 1> acc(regions[0], FID_VAL);
+    Rect<1> rect = runtime->get_index_space_domain(ctx,
+        task->regions[0].region.get_index_space());
+    for (PointInRectIterator<1> pir(rect); pir(); pir++)
+        acc[*pir] = 0.0;
+}
+
+// ---------------------------------------------------------------------------
+// INIT_COPY_TASK – copy data from task argument into a sub-region
+// ---------------------------------------------------------------------------
+void init_copy_task(const Task *task,
+                    const std::vector<PhysicalRegion> &regions,
+                    Context ctx, Runtime *runtime)
+{
+    const double *data = reinterpret_cast<const double *>(task->args);
+    const FieldAccessor<WRITE_DISCARD, double, 1> acc(regions[0], FID_VAL);
+    Rect<1> rect = runtime->get_index_space_domain(ctx,
+        task->regions[0].region.get_index_space());
+    int idx = 0;
+    for (PointInRectIterator<1> pir(rect); pir(); pir++)
+        acc[*pir] = data[idx++];
+}
+
+// ---------------------------------------------------------------------------
+// GET_FIRST_ELEM_TASK – return the first element of a sub-region
+// ---------------------------------------------------------------------------
+double get_first_elem_task(const Task *task,
+                           const std::vector<PhysicalRegion> &regions,
+                           Context ctx, Runtime *runtime)
+{
+    const FieldAccessor<READ_ONLY, double, 1> acc(regions[0], FID_VAL);
+    Rect<1> rect = runtime->get_index_space_domain(ctx,
+        task->regions[0].region.get_index_space());
+    return acc[rect.lo];
+}
+
+// ---------------------------------------------------------------------------
+// GET_LAST_ELEM_TASK – return the last element of a sub-region
+// ---------------------------------------------------------------------------
+double get_last_elem_task(const Task *task,
+                          const std::vector<PhysicalRegion> &regions,
+                          Context ctx, Runtime *runtime)
+{
+    const FieldAccessor<READ_ONLY, double, 1> acc(regions[0], FID_VAL);
+    Rect<1> rect = runtime->get_index_space_domain(ctx,
+        task->regions[0].region.get_index_space());
+    return acc[rect.hi];
+}
+
+// ---------------------------------------------------------------------------
+// SYSTEM_TASK – compute dpdt = f(q) for one block
+// Region 0: Q block (READ_ONLY)
+// Region 1: DPDT block (WRITE_DISCARD)
+// Futures: left ghost (if not first), right ghost (if not last)
+// ---------------------------------------------------------------------------
+void system_task(const Task *task,
+                 const std::vector<PhysicalRegion> &regions,
+                 Context ctx, Runtime *runtime)
+{
+    const SystemArgs *args = reinterpret_cast<const SystemArgs *>(task->args);
+    const int block_idx  = args->block_idx;
+    const int num_blocks = args->num_blocks;
+    const bool is_first  = (block_idx == 0);
+    const bool is_last   = (block_idx == num_blocks - 1);
+
+    const FieldAccessor<READ_ONLY, double, 1> acc_q(regions[0], FID_VAL);
+    const FieldAccessor<WRITE_DISCARD, double, 1> acc_dpdt(regions[1], FID_VAL);
+
+    Rect<1> rect = runtime->get_index_space_domain(ctx,
+        task->regions[0].region.get_index_space());
+
+    const coord_t lo = rect.lo[0];
+    const size_t  N  = rect.hi[0] - lo + 1;
+
+    // Read q into a local buffer
+    std::vector<double> q(N);
+    for (size_t i = 0; i < N; i++)
+        q[i] = acc_q[lo + (coord_t)i];
+
+    // Retrieve ghost values from futures
+    int fidx = 0;
+    double q_left_ghost  = 0.0;
+    double q_right_ghost = 0.0;
+    if (!is_first)
+        q_left_ghost = task->futures[fidx++].get_result<double>();
+    if (!is_last)
+        q_right_ghost = task->futures[fidx++].get_result<double>();
+
+    // Compute forces (matches system.hpp logic)
+    std::vector<double> dpdt(N);
+
+    double coupling_lr;
+    if (is_first)
+        coupling_lr = -signed_pow(q[0], LAMBDA - 1);
+    else
+        coupling_lr = -signed_pow(q[0] - q_left_ghost, LAMBDA - 1);
+
+    for (size_t i = 0; i < N - 1; i++) {
+        dpdt[i]     = -signed_pow(q[i], KAPPA - 1) + coupling_lr;
+        coupling_lr =  signed_pow(q[i] - q[i + 1], LAMBDA - 1);
+        dpdt[i]    -= coupling_lr;
+    }
+
+    if (is_last) {
+        dpdt[N - 1] = -signed_pow(q[N - 1], KAPPA - 1)
+                      + coupling_lr
+                      - signed_pow(q[N - 1], LAMBDA - 1);
+    } else {
+        dpdt[N - 1] = -signed_pow(q[N - 1], KAPPA - 1)
+                      + coupling_lr
+                      - signed_pow(q[N - 1] - q_right_ghost, LAMBDA - 1);
+    }
+
+    // Write dpdt
+    for (size_t i = 0; i < N; i++)
+        acc_dpdt[lo + (coord_t)i] = dpdt[i];
+}
+
+// ---------------------------------------------------------------------------
+// SCALE_SUM2_TASK – x = alpha1*x + alpha2*y
+// Region 0: x (READ_WRITE)
+// Region 1: y (READ_ONLY)
+// ---------------------------------------------------------------------------
+void scale_sum2_task(const Task *task,
+                     const std::vector<PhysicalRegion> &regions,
+                     Context ctx, Runtime *runtime)
+{
+    const ScaleSum2Args *args =
+        reinterpret_cast<const ScaleSum2Args *>(task->args);
+
+    const FieldAccessor<READ_WRITE, double, 1> acc_x(regions[0], FID_VAL);
+    const FieldAccessor<READ_ONLY,  double, 1> acc_y(regions[1], FID_VAL);
+
+    Rect<1> rect = runtime->get_index_space_domain(ctx,
+        task->regions[0].region.get_index_space());
+
+    for (PointInRectIterator<1> pir(rect); pir(); pir++)
+        acc_x[*pir] = args->alpha1 * acc_x[*pir] + args->alpha2 * acc_y[*pir];
+}
+
+// ---------------------------------------------------------------------------
+// Helper: launch system evaluation across all M blocks
+// ---------------------------------------------------------------------------
+static void launch_system_eval(Context ctx, Runtime *runtime,
+                               LogicalPartition q_lp,  LogicalRegion q_lr,
+                               LogicalPartition dpdt_lp, LogicalRegion dpdt_lr,
+                               size_t M)
+{
+    // 1. Extract boundary values from every block
+    std::vector<Future> first_elems(M);
+    std::vector<Future> last_elems(M);
+
+    for (size_t i = 0; i < M; i++) {
+        LogicalRegion q_sub =
+            runtime->get_logical_subregion_by_color(ctx, q_lp, (coord_t)i);
+
+        {
+            TaskLauncher launcher(GET_FIRST_ELEM_TASK_ID,
+                                  TaskArgument(nullptr, 0));
+            launcher.add_region_requirement(
+                RegionRequirement(q_sub, READ_ONLY, EXCLUSIVE, q_lr));
+            launcher.region_requirements[0].add_field(FID_VAL);
+            first_elems[i] = runtime->execute_task(ctx, launcher);
+        }
+        {
+            TaskLauncher launcher(GET_LAST_ELEM_TASK_ID,
+                                  TaskArgument(nullptr, 0));
+            launcher.add_region_requirement(
+                RegionRequirement(q_sub, READ_ONLY, EXCLUSIVE, q_lr));
+            launcher.region_requirements[0].add_field(FID_VAL);
+            last_elems[i] = runtime->execute_task(ctx, launcher);
+        }
+    }
+
+    // 2. Launch system tasks with ghost-value futures
+    for (size_t i = 0; i < M; i++) {
+        LogicalRegion q_sub =
+            runtime->get_logical_subregion_by_color(ctx, q_lp, (coord_t)i);
+        LogicalRegion dpdt_sub =
+            runtime->get_logical_subregion_by_color(ctx, dpdt_lp, (coord_t)i);
+
+        SystemArgs sargs;
+        sargs.block_idx  = (int)i;
+        sargs.num_blocks = (int)M;
+
+        TaskLauncher launcher(SYSTEM_TASK_ID,
+                              TaskArgument(&sargs, sizeof(sargs)));
+        launcher.add_region_requirement(
+            RegionRequirement(q_sub, READ_ONLY, EXCLUSIVE, q_lr));
+        launcher.region_requirements[0].add_field(FID_VAL);
+        launcher.add_region_requirement(
+            RegionRequirement(dpdt_sub, WRITE_DISCARD, EXCLUSIVE, dpdt_lr));
+        launcher.region_requirements[1].add_field(FID_VAL);
+
+        // Left ghost (last element of block i-1)
+        if (i > 0)
+            launcher.add_future(last_elems[i - 1]);
+        // Right ghost (first element of block i+1)
+        if (i < M - 1)
+            launcher.add_future(first_elems[i + 1]);
+
+        runtime->execute_task(ctx, launcher);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: launch scale_sum2 across all M blocks
+//   rw_region = alpha1 * rw_region + alpha2 * ro_region
+// ---------------------------------------------------------------------------
+static void launch_scale_sum2(Context ctx, Runtime *runtime,
+                              LogicalPartition rw_lp, LogicalRegion rw_lr,
+                              LogicalPartition ro_lp, LogicalRegion ro_lr,
+                              size_t M, double alpha1, double alpha2)
+{
+    ScaleSum2Args sargs;
+    sargs.alpha1 = alpha1;
+    sargs.alpha2 = alpha2;
+
+    for (size_t i = 0; i < M; i++) {
+        LogicalRegion rw_sub =
+            runtime->get_logical_subregion_by_color(ctx, rw_lp, (coord_t)i);
+        LogicalRegion ro_sub =
+            runtime->get_logical_subregion_by_color(ctx, ro_lp, (coord_t)i);
+
+        TaskLauncher launcher(SCALE_SUM2_TASK_ID,
+                              TaskArgument(&sargs, sizeof(sargs)));
+        launcher.add_region_requirement(
+            RegionRequirement(rw_sub, READ_WRITE, EXCLUSIVE, rw_lr));
+        launcher.region_requirements[0].add_field(FID_VAL);
+        launcher.add_region_requirement(
+            RegionRequirement(ro_sub, READ_ONLY, EXCLUSIVE, ro_lr));
+        launcher.region_requirements[1].add_field(FID_VAL);
+
+        runtime->execute_task(ctx, launcher);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Energy computation (inline-mapped, sequential – mirrors system.hpp energy())
+// ---------------------------------------------------------------------------
+static double compute_energy(Context ctx, Runtime *runtime,
+                             LogicalRegion q_lr, LogicalRegion p_lr,
+                             size_t N)
+{
+    RegionRequirement req_q(q_lr, READ_ONLY, EXCLUSIVE, q_lr);
+    req_q.add_field(FID_VAL);
+    RegionRequirement req_p(p_lr, READ_ONLY, EXCLUSIVE, p_lr);
+    req_p.add_field(FID_VAL);
+
+    InlineLauncher il_q(req_q);
+    InlineLauncher il_p(req_p);
+
+    PhysicalRegion pr_q = runtime->map_region(ctx, il_q);
+    PhysicalRegion pr_p = runtime->map_region(ctx, il_p);
+    pr_q.wait_until_valid();
+    pr_p.wait_until_valid();
+
+    const FieldAccessor<READ_ONLY, double, 1> acc_q(pr_q, FID_VAL);
+    const FieldAccessor<READ_ONLY, double, 1> acc_p(pr_p, FID_VAL);
+
+    std::vector<double> q(N), p(N);
+    for (size_t i = 0; i < N; i++) {
+        q[i] = acc_q[(coord_t)i];
+        p[i] = acc_p[(coord_t)i];
+    }
+
+    runtime->unmap_region(ctx, pr_q);
+    runtime->unmap_region(ctx, pr_p);
+
+    // Same formula as in system.hpp energy(dvec,dvec)
+    double energy = 0.5 * checked_math::pow(std::abs(q[0]), LAMBDA) / LAMBDA;
+    for (size_t i = 0; i < N - 1; i++) {
+        energy += 0.5 * p[i] * p[i]
+                + checked_math::pow(q[i], KAPPA) / KAPPA
+                + checked_math::pow(std::abs(q[i] - q[i + 1]), LAMBDA) / LAMBDA;
+    }
+    energy += 0.5 * p[N - 1] * p[N - 1]
+            + checked_math::pow(q[N - 1], KAPPA) / KAPPA
+            + 0.5 * checked_math::pow(std::abs(q[N - 1]), LAMBDA) / LAMBDA;
+    return energy;
+}
+
+// ---------------------------------------------------------------------------
+// Top-level task
+// ---------------------------------------------------------------------------
+void top_level_task(const Task *task,
+                    const std::vector<PhysicalRegion> & /*regions*/,
+                    Context ctx, Runtime *runtime)
+{
+    // ---- command-line parsing (--N, --G, --steps, --dt) -------------------
+    size_t N     = 1024;
+    size_t G     = 128;
+    size_t steps = 100;
+    double dt    = 0.01;
+
+    const InputArgs &command_args = Runtime::get_input_args();
+    for (int i = 1; i < command_args.argc; i++) {
+        if (strcmp(command_args.argv[i], "--N") == 0 && i + 1 < command_args.argc)
+            N = (size_t)atol(command_args.argv[++i]);
+        else if (strcmp(command_args.argv[i], "--G") == 0 && i + 1 < command_args.argc)
+            G = (size_t)atol(command_args.argv[++i]);
+        else if (strcmp(command_args.argv[i], "--steps") == 0 && i + 1 < command_args.argc)
+            steps = (size_t)atol(command_args.argv[++i]);
+        else if (strcmp(command_args.argv[i], "--dt") == 0 && i + 1 < command_args.argc)
+            dt = atof(command_args.argv[++i]);
+    }
+
+    const size_t M = N / G;
+
+    // ---- output file ------------------------------------------------------
+    std::ofstream outfile("odeint.txt");
+    if (!outfile.is_open()) {
+        std::cerr << "Failed to open odeint.txt for writing." << std::endl;
+        return;
+    }
+    outfile << "Dimension: " << N
+            << ", number of elements per dataflow: " << G
+            << ", number of dataflow: " << M
+            << ", steps: " << steps
+            << ", dt: " << dt << std::endl;
+
+    // ---- create index space & field space ---------------------------------
+    Rect<1> elem_rect(0, (coord_t)(N - 1));
+    IndexSpace is = runtime->create_index_space(ctx, elem_rect);
+
+    FieldSpace fs = runtime->create_field_space(ctx);
+    {
+        FieldAllocator fa = runtime->create_field_allocator(ctx, fs);
+        fa.allocate_field(sizeof(double), FID_VAL);
+    }
+
+    // ---- create logical regions for q, p, dpdt ----------------------------
+    LogicalRegion q_lr    = runtime->create_logical_region(ctx, is, fs);
+    LogicalRegion p_lr    = runtime->create_logical_region(ctx, is, fs);
+    LogicalRegion dpdt_lr = runtime->create_logical_region(ctx, is, fs);
+
+    // ---- equal partition into M blocks of G elements ----------------------
+    Rect<1> color_rect(0, (coord_t)(M - 1));
+    IndexSpace color_is = runtime->create_index_space(ctx, color_rect);
+    IndexPartition ip = runtime->create_equal_partition(ctx, is, color_is);
+
+    LogicalPartition q_lp    = runtime->get_logical_partition(ctx, q_lr, ip);
+    LogicalPartition p_lp    = runtime->get_logical_partition(ctx, p_lr, ip);
+    LogicalPartition dpdt_lp = runtime->get_logical_partition(ctx, dpdt_lr, ip);
+
+    // ---- generate random initial momentum (same RNG as HPX version) -------
+    std::vector<double> p_init(N);
+    {
+        std::uniform_real_distribution<double> distribution(-1.0, 1.0);
+        std::mt19937 engine(0);
+        auto generator = std::bind(distribution, engine);
+        std::generate(p_init.begin(), p_init.end(), std::ref(generator));
+    }
+
+    // ---- initialize q = 0, p = p_init ------------------------------------
+    for (size_t i = 0; i < M; i++) {
+        // q block → zero
+        {
+            LogicalRegion q_sub =
+                runtime->get_logical_subregion_by_color(ctx, q_lp, (coord_t)i);
+            TaskLauncher launcher(INIT_ZERO_TASK_ID,
+                                  TaskArgument(nullptr, 0));
+            launcher.add_region_requirement(
+                RegionRequirement(q_sub, WRITE_DISCARD, EXCLUSIVE, q_lr));
+            launcher.region_requirements[0].add_field(FID_VAL);
+            runtime->execute_task(ctx, launcher);
+        }
+        // p block → copy from p_init
+        {
+            LogicalRegion p_sub =
+                runtime->get_logical_subregion_by_color(ctx, p_lp, (coord_t)i);
+            TaskLauncher launcher(INIT_COPY_TASK_ID,
+                TaskArgument(&p_init[i * G], G * sizeof(double)));
+            launcher.add_region_requirement(
+                RegionRequirement(p_sub, WRITE_DISCARD, EXCLUSIVE, p_lr));
+            launcher.region_requirements[0].add_field(FID_VAL);
+            runtime->execute_task(ctx, launcher);
+        }
+        // dpdt block → zero (will be overwritten before use)
+        {
+            LogicalRegion dpdt_sub =
+                runtime->get_logical_subregion_by_color(ctx, dpdt_lp, (coord_t)i);
+            TaskLauncher launcher(INIT_ZERO_TASK_ID,
+                                  TaskArgument(nullptr, 0));
+            launcher.add_region_requirement(
+                RegionRequirement(dpdt_sub, WRITE_DISCARD, EXCLUSIVE, dpdt_lr));
+            launcher.region_requirements[0].add_field(FID_VAL);
+            runtime->execute_task(ctx, launcher);
+        }
+    }
+
+    // ---- compute initial energy -------------------------------------------
+    double e0 = compute_energy(ctx, runtime, q_lr, p_lr, N);
+    outfile << "Initialization complete, energy: "
+            << static_cast<long long>(std::round(e0)) << std::endl;
+
+    // ---- symplectic_rkn_sb3a_mclachlan integration ------------------------
+    // Matches the boost::numeric::odeint implementation exactly:
+    //   do_step_impl: for l=0..NUM_STAGES-1:
+    //       if l > 0: dpdt = f(q)
+    //       p += b[l]*dt*dpdt
+    //       q += a[l]*dt*p
+    //   After loop (in do_step wrapper for next call): dpdt = f(q)
+    //
+    // The initial dpdt = f(q) is computed once before the first step.
+    // Between steps, dpdt = f(q) is recomputed (FSAL).
+
+    // Initial force evaluation (corresponds to sys(q, dpdt) at start of first do_step)
+    launch_system_eval(ctx, runtime, q_lp, q_lr, dpdt_lp, dpdt_lr, M);
+
+    for (size_t step = 0; step < steps; step++) {
+        for (int l = 0; l < NUM_STAGES; l++) {
+            // For l > 0, recompute dpdt = f(q) BEFORE the momentum update
+            if (l > 0) {
+                launch_system_eval(ctx, runtime,
+                                   q_lp, q_lr,
+                                   dpdt_lp, dpdt_lr, M);
+            }
+
+            // p = 1.0 * p + b[l]*dt * dpdt
+            launch_scale_sum2(ctx, runtime,
+                              p_lp, p_lr,
+                              dpdt_lp, dpdt_lr,
+                              M, 1.0, COEF_B[l] * dt);
+
+            // q = 1.0 * q + a[l]*dt * p
+            launch_scale_sum2(ctx, runtime,
+                              q_lp, q_lr,
+                              p_lp, p_lr,
+                              M, 1.0, COEF_A[l] * dt);
+        }
+        // After the loop: recompute dpdt = f(q) for next step's l=0
+        // (FSAL: this is the initial force eval for the next do_step call)
+        // We always do this, even after the last step, to match boost exactly.
+        // (b[5]=0 means the extra p-update is a no-op anyway.)
+        launch_system_eval(ctx, runtime,
+                           q_lp, q_lr,
+                           dpdt_lp, dpdt_lr, M);
+    }
+
+    // ---- compute final energy ---------------------------------------------
+    double e1 = compute_energy(ctx, runtime, q_lr, p_lr, N);
+    outfile << "Integration complete, energy: "
+            << static_cast<long long>(std::round(e1)) << std::endl;
+
+    outfile.close();
+
+    // ---- cleanup ----------------------------------------------------------
+    runtime->destroy_logical_region(ctx, q_lr);
+    runtime->destroy_logical_region(ctx, p_lr);
+    runtime->destroy_logical_region(ctx, dpdt_lr);
+    runtime->destroy_field_space(ctx, fs);
+    runtime->destroy_index_space(ctx, is);
+    runtime->destroy_index_space(ctx, color_is);
+}
+
+// ---------------------------------------------------------------------------
+// main – register tasks and start the Legion runtime
+// ---------------------------------------------------------------------------
+int main(int argc, char **argv)
+{
+    Runtime::set_top_level_task_id(TOP_LEVEL_TASK_ID);
+
+    {
+        TaskVariantRegistrar registrar(TOP_LEVEL_TASK_ID, "top_level");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        Runtime::preregister_task_variant<top_level_task>(registrar, "top_level");
+    }
+    {
+        TaskVariantRegistrar registrar(INIT_ZERO_TASK_ID, "init_zero");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        registrar.set_leaf(true);
+        Runtime::preregister_task_variant<init_zero_task>(registrar, "init_zero");
+    }
+    {
+        TaskVariantRegistrar registrar(INIT_COPY_TASK_ID, "init_copy");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        registrar.set_leaf(true);
+        Runtime::preregister_task_variant<init_copy_task>(registrar, "init_copy");
+    }
+    {
+        TaskVariantRegistrar registrar(SYSTEM_TASK_ID, "system");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        registrar.set_leaf(true);
+        Runtime::preregister_task_variant<system_task>(registrar, "system");
+    }
+    {
+        TaskVariantRegistrar registrar(SCALE_SUM2_TASK_ID, "scale_sum2");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        registrar.set_leaf(true);
+        Runtime::preregister_task_variant<scale_sum2_task>(registrar, "scale_sum2");
+    }
+    {
+        TaskVariantRegistrar registrar(GET_FIRST_ELEM_TASK_ID, "get_first_elem");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        registrar.set_leaf(true);
+        Runtime::preregister_task_variant<double, get_first_elem_task>(
+            registrar, "get_first_elem");
+    }
+    {
+        TaskVariantRegistrar registrar(GET_LAST_ELEM_TASK_ID, "get_last_elem");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        registrar.set_leaf(true);
+        Runtime::preregister_task_variant<double, get_last_elem_task>(
+            registrar, "get_last_elem");
+    }
+
+    return Runtime::start(argc, argv);
+}
+```
+
+[shared_operations.hpp]
+```cpp
+// Copyright 2013 Mario Mulansky
+// operations functionality for odeint – Legion version
+#ifndef SHARED_OPERATIONS_HPP
+#define SHARED_OPERATIONS_HPP
+
+#include <cstddef>
+#include <cstring>
+#include <cassert>
+#include "legion.h"
+
+using namespace Legion;
+
+// Common field ID for double-valued data stored in logical regions
+enum FieldIDs {
+    FID_VAL = 0,
+};
+
+// Serializable argument structure for scale_sum2 Legion tasks
+struct scale_sum2_args_t {
+    double alpha1;
+    double alpha2;
+};
+
+struct local_dataflow_shared_operations
+{
+    template<typename Fac1, typename Fac2 = Fac1>
+    struct scale_sum2
+    {
+        const Fac1 m_alpha1;
+        const Fac2 m_alpha2;
+
+        scale_sum2()
+            : m_alpha1(0), m_alpha2(0)
+        {}
+
+        scale_sum2(Fac1 alpha1, Fac2 alpha2)
+            : m_alpha1(alpha1), m_alpha2(alpha2)
+        {}
+
+        // Apply on raw double arrays (for use within a Legion task body)
+        void operator()(double *x1, const double *x2, const double *x3, std::size_t N) const
+        {
+            for (std::size_t i = 0; i < N; ++i)
+                x1[i] = m_alpha1 * x2[i] + m_alpha2 * x3[i];
+        }
+
+        // Pack coefficients into a task-argument struct for Legion task launch
+        scale_sum2_args_t pack_args() const
+        {
+            return { static_cast<double>(m_alpha1),
+                     static_cast<double>(m_alpha2) };
+        }
+    };
+};
+
+// Legion task: x1[i] = alpha1 * x2[i] + alpha2 * x3[i]  (3 distinct regions)
+// regions[0]: x1 (WRITE_DISCARD, FID_VAL)
+// regions[1]: x2 (READ_ONLY,     FID_VAL)
+// regions[2]: x3 (READ_ONLY,     FID_VAL)
+// task->args : scale_sum2_args_t
+inline void scale_sum2_task(const Task *task,
+                            const std::vector<PhysicalRegion> &regions,
+                            Context ctx, Runtime *runtime)
+{
+    assert(regions.size() == 3);
+    assert(task->arglen == sizeof(scale_sum2_args_t));
+
+    scale_sum2_args_t args;
+    std::memcpy(&args, task->args, sizeof(scale_sum2_args_t));
+
+    const FieldAccessor<WRITE_DISCARD, double, 1> acc_x1(regions[0], FID_VAL);
+    const FieldAccessor<READ_ONLY, double, 1>     acc_x2(regions[1], FID_VAL);
+    const FieldAccessor<READ_ONLY, double, 1>     acc_x3(regions[2], FID_VAL);
+
+    Domain dom = runtime->get_index_space_domain(ctx,
+        task->regions[0].region.get_index_space());
+    Rect<1> rect(dom);
+
+    for (PointInRectIterator<1> pir(rect); pir(); pir++)
+        acc_x1[*pir] = args.alpha1 * acc_x2[*pir] + args.alpha2 * acc_x3[*pir];
+}
+
+// In-place Legion task: x1[i] = alpha1 * x1[i] + alpha2 * x2[i]  (2 regions)
+// regions[0]: x1 (READ_WRITE, FID_VAL)
+// regions[1]: x2 (READ_ONLY,  FID_VAL)
+// task->args : scale_sum2_args_t
+inline void scale_sum2_inplace_task(const Task *task,
+                                    const std::vector<PhysicalRegion> &regions,
+                                    Context ctx, Runtime *runtime)
+{
+    assert(regions.size() == 2);
+    assert(task->arglen == sizeof(scale_sum2_args_t));
+
+    scale_sum2_args_t args;
+    std::memcpy(&args, task->args, sizeof(scale_sum2_args_t));
+
+    const FieldAccessor<READ_WRITE, double, 1> acc_x1(regions[0], FID_VAL);
+    const FieldAccessor<READ_ONLY, double, 1>  acc_x2(regions[1], FID_VAL);
+
+    Domain dom = runtime->get_index_space_domain(ctx,
+        task->regions[0].region.get_index_space());
+    Rect<1> rect(dom);
+
+    for (PointInRectIterator<1> pir(rect); pir(); pir++)
+        acc_x1[*pir] = args.alpha1 * acc_x1[*pir] + args.alpha2 * acc_x2[*pir];
+}
+
+#endif
+```
+
+[shared_resize.hpp]
+```cpp
+// Copyright 2013 Mario Mulansky
+// resizing functionality for odeint — Legion translation
+#ifndef SHARED_RESIZE_HPP
+#define SHARED_RESIZE_HPP
+
+#include <iostream>
+#include <vector>
+
+#include <boost/numeric/odeint/util/state_wrapper.hpp>
+#include <boost/numeric/odeint/util/is_resizeable.hpp>
+#include <boost/numeric/odeint/util/resize.hpp>
+#include <boost/numeric/odeint/util/same_size.hpp>
+
+#include <legion.h>
+
+using namespace Legion;
+
+typedef std::vector<double> dvec;
+
+enum FieldIDs {
+    FID_VAL = 0,
+};
+
+struct state_type {
+    std::vector<LogicalRegion> regions;
+    Runtime *runtime;
+    Context ctx;
+
+    state_type() : runtime(nullptr), ctx() {}
+
+    explicit state_type(size_t n) : regions(n), runtime(nullptr), ctx() {}
+
+    size_t size() const { return regions.size(); }
+
+    LogicalRegion& operator[](size_t i) { return regions[i]; }
+    const LogicalRegion& operator[](size_t i) const { return regions[i]; }
+
+    void resize(size_t n) { regions.resize(n); }
+
+    // Iterators for boost::size / range compatibility
+    auto begin() { return regions.begin(); }
+    auto end() { return regions.end(); }
+    auto begin() const { return regions.begin(); }
+    auto end() const { return regions.end(); }
+};
+
+namespace boost {
+namespace numeric {
+namespace odeint {
+
+template<>
+struct is_resizeable<state_type>
+{
+    typedef boost::true_type type;
+    const static bool value = type::value;
+};
+
+template<>
+struct same_size_impl<state_type, state_type>
+{
+    static bool same_size(const state_type &x1,
+                          const state_type &x2)
+    {
+        return (x1.size() == x2.size());
+    }
+};
+
+template<>
+struct resize_impl<state_type, state_type>
+{
+    static void resize(state_type &x1,
+                       state_type x2)
+    {
+        x1.runtime = x2.runtime;
+        x1.ctx = x2.ctx;
+        x1.regions.resize(x2.size());
+
+        for (size_t i = 0; i < x2.size(); ++i)
+        {
+            // Determine the size of x2's i-th region
+            Domain dom = x1.runtime->get_index_space_domain(
+                x2.regions[i].get_index_space());
+            Rect<1> rect = dom;
+            size_t n = rect.hi[0] - rect.lo[0] + 1;
+
+            // Create a new logical region with the same size
+            IndexSpace is = x1.runtime->create_index_space(
+                x1.ctx, Rect<1>(0, n - 1));
+            FieldSpace fs = x1.runtime->create_field_space(x1.ctx);
+            {
+                FieldAllocator fa = x1.runtime->create_field_allocator(
+                    x1.ctx, fs);
+                fa.allocate_field(sizeof(double), FID_VAL);
+            }
+            x1.regions[i] = x1.runtime->create_logical_region(
+                x1.ctx, is, fs);
+
+            // Zero-initialize the new region (matches HPX behavior
+            // where dvec(size) value-initializes to 0.0)
+            x1.runtime->fill_field(x1.ctx, x1.regions[i],
+                                   x1.regions[i], FID_VAL, 0.0);
+        }
+    }
+};
+
+} // namespace odeint
+} // namespace numeric
+} // namespace boost
+
+#endif
+```
+
+[system.hpp]
+```cpp
+// Copyright 2013 Mario Mulansky
+
+#ifndef SYSTEM_HPP
+#define SYSTEM_HPP
+
+#include <vector>
+#include <cmath>
+#include <cassert>
+
+#include "legion.h"
+#include <boost/math/special_functions/sign.hpp>
+
+using namespace Legion;
+
+const double KAPPA = 3.5;
+const double LAMBDA = 4.5;
+
+// Common task and field IDs shared across the project
+#ifndef COMMON_IDS_DEFINED
+#define COMMON_IDS_DEFINED
+enum TaskIDs {
+    TOP_LEVEL_TASK_ID = 0,
+    INIT_ZERO_TASK_ID,
+    INIT_COPY_TASK_ID,
+    SYSTEM_FIRST_BLOCK_TASK_ID,
+    SYSTEM_CENTER_BLOCK_TASK_ID,
+    SYSTEM_LAST_BLOCK_TASK_ID,
+    SCALE_SUM2_TASK_ID,
+};
+
+enum FieldIDs {
+    FID_VAL = 0,
+};
+
+struct state_type {
+    LogicalRegion region;
+    LogicalPartition partition;
+    size_t num_parts;   // M
+    size_t block_size;  // G
+};
+#endif // COMMON_IDS_DEFINED
+
+typedef std::vector<double> dvec;
+
+namespace checked_math {
+    inline double pow(double x, double y)
+    {
+        if (x == 0.0)
+            return 0.0;
+        using std::pow;
+        using std::abs;
+        return pow(abs(x), y);
+    }
+}
+
+inline double signed_pow(double x, double k)
+{
+    using boost::math::sign;
+    using std::abs;
+    return checked_math::pow(x, k) * sign(x);
+}
+
+// ============================================================
+// Task: compute dpdt for the first block
+// Regions: [0] q_block (RO), [1] q_next_block (RO), [2] dpdt_block (WD)
+// ============================================================
+inline void system_first_block_task(const Task *task,
+                                    const std::vector<PhysicalRegion> &regions,
+                                    Context ctx, Runtime *runtime)
+{
+    const FieldAccessor<READ_ONLY, double, 1> q(regions[0], FID_VAL);
+    const FieldAccessor<READ_ONLY, double, 1> q_next(regions[1], FID_VAL);
+    const FieldAccessor<WRITE_DISCARD, double, 1> dpdt(regions[2], FID_VAL);
+
+    Rect<1> rect(runtime->get_index_space_domain(ctx,
+        task->regions[0].region.get_index_space()));
+    Rect<1> next_rect(runtime->get_index_space_domain(ctx,
+        task->regions[1].region.get_index_space()));
+
+    coord_t lo = rect.lo[0];
+    coord_t hi = rect.hi[0];
+
+    // First element of next block (coupling neighbor)
+    double q_r = q_next[next_rect.lo];
+
+    double coupling_lr = -signed_pow(q[lo], LAMBDA - 1);
+    for (coord_t i = lo; i < hi; ++i)
+    {
+        double val = -signed_pow(q[i], KAPPA - 1) + coupling_lr;
+        coupling_lr = signed_pow(q[i] - q[i + 1], LAMBDA - 1);
+        val -= coupling_lr;
+        dpdt[i] = val;
+    }
+    dpdt[hi] = -signed_pow(q[hi], KAPPA - 1)
+        + coupling_lr - signed_pow(q[hi] - q_r, LAMBDA - 1);
+}
+
+// ============================================================
+// Task: compute dpdt for a center block
+// Regions: [0] q_block (RO), [1] q_prev_block (RO),
+//          [2] q_next_block (RO), [3] dpdt_block (WD)
+// ============================================================
+inline void system_center_block_task(const Task *task,
+                                     const std::vector<PhysicalRegion> &regions,
+                                     Context ctx, Runtime *runtime)
+{
+    const FieldAccessor<READ_ONLY, double, 1> q(regions[0], FID_VAL);
+    const FieldAccessor<READ_ONLY, double, 1> q_prev(regions[1], FID_VAL);
+    const FieldAccessor<READ_ONLY, double, 1> q_next(regions[2], FID_VAL);
+    const FieldAccessor<WRITE_DISCARD, double, 1> dpdt(regions[3], FID_VAL);
+
+    Rect<1> rect(runtime->get_index_space_domain(ctx,
+        task->regions[0].region.get_index_space()));
+    Rect<1> prev_rect(runtime->get_index_space_domain(ctx,
+        task->regions[1].region.get_index_space()));
+    Rect<1> next_rect(runtime->get_index_space_domain(ctx,
+        task->regions[2].region.get_index_space()));
+
+    coord_t lo = rect.lo[0];
+    coord_t hi = rect.hi[0];
+
+    // Last element of previous block, first element of next block
+    double q_l = q_prev[prev_rect.hi];
+    double q_r = q_next[next_rect.lo];
+
+    double coupling_lr = -signed_pow(q[lo] - q_l, LAMBDA - 1);
+    for (coord_t i = lo; i < hi; ++i)
+    {
+        double val = -signed_pow(q[i], KAPPA - 1) + coupling_lr;
+        coupling_lr = signed_pow(q[i] - q[i + 1], LAMBDA - 1);
+        val -= coupling_lr;
+        dpdt[i] = val;
+    }
+    dpdt[hi] = -signed_pow(q[hi], KAPPA - 1)
+        + coupling_lr - signed_pow(q[hi] - q_r, LAMBDA - 1);
+}
+
+// ============================================================
+// Task: compute dpdt for the last block
+// Regions: [0] q_block (RO), [1] q_prev_block (RO), [2] dpdt_block (WD)
+// ============================================================
+inline void system_last_block_task(const Task *task,
+                                   const std::vector<PhysicalRegion> &regions,
+                                   Context ctx, Runtime *runtime)
+{
+    const FieldAccessor<READ_ONLY, double, 1> q(regions[0], FID_VAL);
+    const FieldAccessor<READ_ONLY, double, 1> q_prev(regions[1], FID_VAL);
+    const FieldAccessor<WRITE_DISCARD, double, 1> dpdt(regions[2], FID_VAL);
+
+    Rect<1> rect(runtime->get_index_space_domain(ctx,
+        task->regions[0].region.get_index_space()));
+    Rect<1> prev_rect(runtime->get_index_space_domain(ctx,
+        task->regions[1].region.get_index_space()));
+
+    coord_t lo = rect.lo[0];
+    coord_t hi = rect.hi[0];
+
+    // Last element of previous block
+    double q_l = q_prev[prev_rect.hi];
+
+    double coupling_lr = -signed_pow(q[lo] - q_l, LAMBDA - 1);
+    for (coord_t i = lo; i < hi; ++i)
+    {
+        double val = -signed_pow(q[i], KAPPA - 1) + coupling_lr;
+        coupling_lr = signed_pow(q[i] - q[i + 1], LAMBDA - 1);
+        val -= coupling_lr;
+        dpdt[i] = val;
+    }
+    dpdt[hi] = -signed_pow(q[hi], KAPPA - 1)
+        + coupling_lr - signed_pow(q[hi], LAMBDA - 1);
+}
+
+// ============================================================
+// System function: launches Legion tasks (non-blocking).
+// Legion runtime resolves dependencies via region requirements.
+// ============================================================
+inline void osc_chain(state_type &q, state_type &dpdt,
+                      Runtime *runtime, Context ctx)
+{
+    const size_t M = q.num_parts;
+
+    // Helper to look up a sub-region by partition color
+    auto sub = [&](const state_type &s, size_t color) -> LogicalRegion {
+        return runtime->get_logical_subregion_by_color(ctx,
+            s.partition, DomainPoint(Point<1>((coord_t)color)));
+    };
+
+    // First block
+    {
+        TaskLauncher launcher(SYSTEM_FIRST_BLOCK_TASK_ID, TaskArgument(NULL, 0));
+        launcher.add_region_requirement(
+            RegionRequirement(sub(q, 0), READ_ONLY, EXCLUSIVE, q.region));
+        launcher.region_requirements[0].add_field(FID_VAL);
+        launcher.add_region_requirement(
+            RegionRequirement(sub(q, 1), READ_ONLY, EXCLUSIVE, q.region));
+        launcher.region_requirements[1].add_field(FID_VAL);
+        launcher.add_region_requirement(
+            RegionRequirement(sub(dpdt, 0), WRITE_DISCARD, EXCLUSIVE, dpdt.region));
+        launcher.region_requirements[2].add_field(FID_VAL);
+        runtime->execute_task(ctx, launcher);
+    }
+
+    // Middle blocks
+    for (size_t i = 1; i < M - 1; i++)
+    {
+        TaskLauncher launcher(SYSTEM_CENTER_BLOCK_TASK_ID, TaskArgument(NULL, 0));
+        launcher.add_region_requirement(
+            RegionRequirement(sub(q, i), READ_ONLY, EXCLUSIVE, q.region));
+        launcher.region_requirements[0].add_field(FID_VAL);
+        launcher.add_region_requirement(
+            RegionRequirement(sub(q, i - 1), READ_ONLY, EXCLUSIVE, q.region));
+        launcher.region_requirements[1].add_field(FID_VAL);
+        launcher.add_region_requirement(
+            RegionRequirement(sub(q, i + 1), READ_ONLY, EXCLUSIVE, q.region));
+        launcher.region_requirements[2].add_field(FID_VAL);
+        launcher.add_region_requirement(
+            RegionRequirement(sub(dpdt, i), WRITE_DISCARD, EXCLUSIVE, dpdt.region));
+        launcher.region_requirements[3].add_field(FID_VAL);
+        runtime->execute_task(ctx, launcher);
+    }
+
+    // Last block
+    if (M > 1)
+    {
+        TaskLauncher launcher(SYSTEM_LAST_BLOCK_TASK_ID, TaskArgument(NULL, 0));
+        launcher.add_region_requirement(
+            RegionRequirement(sub(q, M - 1), READ_ONLY, EXCLUSIVE, q.region));
+        launcher.region_requirements[0].add_field(FID_VAL);
+        launcher.add_region_requirement(
+            RegionRequirement(sub(q, M - 2), READ_ONLY, EXCLUSIVE, q.region));
+        launcher.region_requirements[1].add_field(FID_VAL);
+        launcher.add_region_requirement(
+            RegionRequirement(sub(dpdt, M - 1), WRITE_DISCARD, EXCLUSIVE, dpdt.region));
+        launcher.region_requirements[2].add_field(FID_VAL);
+        runtime->execute_task(ctx, launcher);
+    }
+}
+
+// Version with global barrier (equivalent to HPX wait_all)
+inline void osc_chain_gb(state_type &q, state_type &dpdt,
+                         Runtime *runtime, Context ctx)
+{
+    osc_chain(q, dpdt, runtime, ctx);
+    // Execution fence: all previously launched tasks in this context
+    // must complete before any subsequently launched tasks begin.
+    Future fence = runtime->issue_execution_fence(ctx);
+    fence.get_void_result();
+}
+
+// ============================================================
+// Energy computation (scalar version on plain vectors)
+// ============================================================
+inline double energy(const dvec &q, const dvec &p)
+{
+    using checked_math::pow;
+    using std::abs;
+    const size_t N = q.size();
+    double en = 0.5 * pow(abs(q[0]), LAMBDA) / LAMBDA;
+    for (size_t i = 0; i < N - 1; ++i)
+    {
+        en += 0.5 * p[i] * p[i] + pow(q[i], KAPPA) / KAPPA
+            + pow(abs(q[i] - q[i + 1]), LAMBDA) / LAMBDA;
+    }
+    en += 0.5 * p[N - 1] * p[N - 1] + pow(q[N - 1], KAPPA) / KAPPA
+        + 0.5 * pow(abs(q[N - 1]), LAMBDA) / LAMBDA;
+    return en;
+}
+
+// ============================================================
+// Energy computation on Legion state_type (inline-maps regions)
+// ============================================================
+inline double energy(const state_type &q_state, const state_type &p_state,
+                     Runtime *runtime, Context ctx)
+{
+    // Inline-map both full regions for reading.
+    // The runtime will automatically wait for any outstanding
+    // writes (e.g. from osc_chain tasks) to complete first.
+    RegionRequirement q_req(q_state.region, READ_ONLY, EXCLUSIVE, q_state.region);
+    q_req.add_field(FID_VAL);
+    PhysicalRegion q_phys = runtime->map_region(ctx, q_req);
+    q_phys.wait_until_valid();
+
+    RegionRequirement p_req(p_state.region, READ_ONLY, EXCLUSIVE, p_state.region);
+    p_req.add_field(FID_VAL);
+    PhysicalRegion p_phys = runtime->map_region(ctx, p_req);
+    p_phys.wait_until_valid();
+
+    const FieldAccessor<READ_ONLY, double, 1> q_acc(q_phys, FID_VAL);
+    const FieldAccessor<READ_ONLY, double, 1> p_acc(p_phys, FID_VAL);
+
+    Rect<1> rect(runtime->get_index_space_domain(ctx,
+        q_state.region.get_index_space()));
+    coord_t lo = rect.lo[0];
+    coord_t hi = rect.hi[0];
+    size_t N = (size_t)(hi - lo + 1);
+
+    // Gather into contiguous vectors and reuse scalar energy()
+    dvec q_vec(N), p_vec(N);
+    for (coord_t i = lo; i <= hi; ++i)
+    {
+        q_vec[(size_t)(i - lo)] = q_acc[i];
+        p_vec[(size_t)(i - lo)] = p_acc[i];
+    }
+
+    runtime->unmap_region(ctx, q_phys);
+    runtime->unmap_region(ctx, p_phys);
+
+    return energy(q_vec, p_vec);
+}
+
+// ============================================================
+// Task registration (call from main before Runtime::start)
+// ============================================================
+inline void register_system_tasks()
+{
+    {
+        TaskVariantRegistrar registrar(SYSTEM_FIRST_BLOCK_TASK_ID,
+                                       "system_first_block");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        Runtime::preregister_task_variant<system_first_block_task>(
+            registrar, "system_first_block");
+    }
+    {
+        TaskVariantRegistrar registrar(SYSTEM_CENTER_BLOCK_TASK_ID,
+                                       "system_center_block");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        Runtime::preregister_task_variant<system_center_block_task>(
+            registrar, "system_center_block");
+    }
+    {
+        TaskVariantRegistrar registrar(SYSTEM_LAST_BLOCK_TASK_ID,
+                                       "system_last_block");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        Runtime::preregister_task_variant<system_last_block_task>(
+            registrar, "system_last_block");
+    }
+}
+
+#endif // SYSTEM_HPP
+```

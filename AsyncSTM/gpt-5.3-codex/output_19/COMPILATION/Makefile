@@ -1,0 +1,71 @@
+CXX ?= g++
+
+# Expect Legion_DIR to point to Legion's CMake package config directory.
+# (e.g. <install-prefix>/lib/cmake/Legion)
+ifndef Legion_DIR
+$(error Legion_DIR is not set)
+endif
+
+BUILD_DIR := build
+PROGRAMS := binary_tree unit_tests concurrency_tests
+TARGETS := $(addprefix $(BUILD_DIR)/,$(PROGRAMS))
+
+LEGION_PREFIX := $(abspath $(Legion_DIR)/../../..)
+
+# Try CMake package discovery first.
+LEGION_CXXFLAGS := $(shell cmake --find-package \
+	-DNAME=Legion \
+	-DCOMPILER_ID=GNU \
+	-DLANGUAGE=CXX \
+	-DMODE=COMPILE \
+	-DLegion_DIR=$(Legion_DIR) \
+	-DCMAKE_PREFIX_PATH=$(LEGION_PREFIX) 2>/dev/null || true)
+
+LEGION_LDFLAGS := $(shell cmake --find-package \
+	-DNAME=Legion \
+	-DCOMPILER_ID=GNU \
+	-DLANGUAGE=CXX \
+	-DMODE=LINK \
+	-DLegion_DIR=$(Legion_DIR) \
+	-DCMAKE_PREFIX_PATH=$(LEGION_PREFIX) 2>/dev/null || true)
+
+# Fallback when --find-package does not return flags.
+ifeq ($(strip $(LEGION_CXXFLAGS)),)
+LEGION_CXXFLAGS := -I$(LEGION_PREFIX)/include
+endif
+
+ifeq ($(strip $(LEGION_LDFLAGS)),)
+ifneq ("$(wildcard $(LEGION_PREFIX)/lib64)","")
+LEGION_LIB_DIR := $(LEGION_PREFIX)/lib64
+else
+LEGION_LIB_DIR := $(LEGION_PREFIX)/lib
+endif
+LEGION_LDFLAGS := -L$(LEGION_LIB_DIR) -Wl,-rpath,$(LEGION_LIB_DIR) -llegion
+endif
+
+ifdef BOOST_ROOT
+BOOST_INCLUDE := -I$(BOOST_ROOT)/include
+BOOST_LIB := -L$(BOOST_ROOT)/lib -Wl,-rpath,$(BOOST_ROOT)/lib
+else
+BOOST_INCLUDE :=
+BOOST_LIB :=
+endif
+
+CXXFLAGS += -std=c++17 -I. -g -pthread -DASTM_LEGION $(BOOST_INCLUDE) $(LEGION_CXXFLAGS)
+LDFLAGS  += -pthread $(LEGION_LDFLAGS) $(BOOST_LIB)
+
+ADDITIONAL_SOURCES :=
+
+.PHONY: all clean directories
+all: directories $(TARGETS)
+
+directories: $(BUILD_DIR)
+
+$(BUILD_DIR):
+	mkdir -p $@
+
+$(BUILD_DIR)/%: %.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(ADDITIONAL_SOURCES) $< -o $@ $(LDFLAGS)
+
+clean:
+	rm -rf $(BUILD_DIR)

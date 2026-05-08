@@ -1,0 +1,36 @@
+{
+  "iteration": 1,
+  "input_tokens": 8614,
+  "output_tokens": 10672,
+  "request_count": 1,
+  "generation_time_s": 151.399,
+  "build_status": true,
+  "run_status": true,
+  "overall_status": "VALIDATION_FAIL",
+  "per_file_status": {
+    "odeint.txt": "VALIDATION_FAIL"
+  },
+  "build_dictionary": {
+    "build_returncode": 0,
+    "build_stdout": "-- The CXX compiler identification is GNU 14.3.0\n-- Detecting CXX compiler ABI info\n-- Detecting CXX compiler ABI info - done\n-- Check for working CXX compiler: /gridapps/software/GCCcore/14.3.0/bin/c++ - skipped\n-- Detecting CXX compile features\n-- Detecting CXX compile features - done\n-- Using Legion_DIR from environment: /Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/share/Legion/cmake\n-- Found ZLIB: /gridapps/software/zlib/1.3.1-GCCcore-14.3.0/lib/libz.so (found version \"1.3.1\")\n-- Found Boost: /Users/robsonlab/Teetly/hpx/boost_1_64_0/install/include (found version \"1.64.0\") found components: program_options\n-- Configuring done (1.1s)\n-- Generating done (0.0s)\n-- Build files have been written to: /tmp/tmp7im79dlz/build\n[ 50%] Building CXX object CMakeFiles/odeint.dir/odeint.cpp.o\n[100%] Linking CXX executable odeint\n[100%] Built target odeint\n",
+    "build_stderr": "CMake Warning (dev) at CMakeLists.txt:20 (find_package):\n  Policy CMP0144 is not set: find_package uses upper-case <PACKAGENAME>_ROOT\n  variables.  Run \"cmake --help-policy CMP0144\" for policy details.  Use the\n  cmake_policy command to set the policy and suppress this warning.\n\n  Environment variable LEGION_ROOT is set to:\n\n    /Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid\n\n  For compatibility, find_package is ignoring the variable, but code in a\n  .cmake module might still use it.\nThis warning is for project developers.  Use -Wno-dev to suppress it.\n\nCMake Warning (dev) at CMakeLists.txt:23 (find_package):\n  Policy CMP0144 is not set: find_package uses upper-case <PACKAGENAME>_ROOT\n  variables.  Run \"cmake --help-policy CMP0144\" for policy details.  Use the\n  cmake_policy command to set the policy and suppress this warning.\n\n  CMake variable BOOST_ROOT is set to:\n\n    /Users/robsonlab/Teetly/hpx/boost_1_64_0/install\n\n  Environment variable BOOST_ROOT is set to:\n\n    /Users/robsonlab/Teetly/hpx/boost_1_64_0/install\n\n  For compatibility, find_package is ignoring the variable, but code in a\n  .cmake module might still use it.\nThis warning is for project developers.  Use -Wno-dev to suppress it.\n\nCMake Warning (dev) at CMakeLists.txt:23 (find_package):\n  Policy CMP0167 is not set: The FindBoost module is removed.  Run \"cmake\n  --help-policy CMP0167\" for policy details.  Use the cmake_policy command to\n  set the policy and suppress this warning.\n\nThis warning is for project developers.  Use -Wno-dev to suppress it.\n\n"
+  },
+  "run_dictionary": {
+    "run_returncodes": [
+      0
+    ],
+    "run_stdouts": [
+      ""
+    ],
+    "run_stderrs": [
+      ""
+    ],
+    "runtime": 4.459,
+    "per_command_runtimes": [
+      4.459
+    ]
+  },
+  "output_files_content": {
+    "odeint.txt": "Dimension: 20480, number of elements per dataflow: 512, number of dataflow: 40, steps: 37, dt: 0.4\nInitialization complete, energy: 3401\nIntegration complete, energy: -9223372036854775808\n"
+  }
+}

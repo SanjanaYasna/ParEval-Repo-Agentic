@@ -1,0 +1,1547 @@
+Looking at the error, the issue is in `binary_tree.cpp` line 204: `acc_value[idx]` returns a Legion accessor helper proxy, not a direct `NodeValue`, so `.data` member access doesn't work. The fix is to copy into a local `NodeValue` first.
+
+[Makefile]
+```make
+CXX=g++
+
+# Derive Legion installation prefix from Legion_DIR
+# Legion_DIR typically points to <prefix>/lib/cmake/Legion or <prefix>/share/Legion/cmake
+ifndef LEGION_ROOT
+  LEGION_ROOT=$(shell cd $(Legion_DIR)/../../.. && pwd)
+endif
+
+LEGION_INCLUDE=-I$(LEGION_ROOT)/include
+LEGION_LIB=-L$(LEGION_ROOT)/lib -llegion -lrealm -Wl,-rpath,$(LEGION_ROOT)/lib
+
+# Include Boost paths
+BOOST_INCLUDE=-I$(BOOST_ROOT)/include
+BOOST_LIB=-L$(BOOST_ROOT)/lib -Wl,-rpath,$(BOOST_ROOT)/lib
+
+CXXFLAGS+=-std=c++17 -I. -g -DASTM_LEGION $(LEGION_INCLUDE) $(BOOST_INCLUDE)
+LDFLAGS=$(LEGION_LIB) $(BOOST_LIB) -lpthread -ldl
+
+ADDITIONAL_SOURCES=
+PROGRAMS=binary_tree unit_tests concurrency_tests
+DIRECTORIES=build
+
+all: directories $(PROGRAMS)
+
+.PHONY: directories
+directories: $(DIRECTORIES)/
+
+$(DIRECTORIES)/:
+	mkdir -p $@
+
+% : %.cpp
+	$(CXX) $(CXXFLAGS) $(ADDITIONAL_SOURCES) $< -o build/$@ $(LDFLAGS)
+
+clean:
+	rm -rf $(DIRECTORIES)
+```
+
+[ReadMe.md]
+```markdown
+# ASTM (Asynchronous Software Transaction Memory)
+
+A header-only Software Transactional Memory (STM) library built on Legion. ASTM provides optimistic concurrency control for shared variables and features such as:
+
+Transaction manager:
+    - Provides transaction-local storage
+    - Implement the four basic operations which occur in transactions: read, write, async, commit 
+
+## Programs
+binary_tree
+Example implementation of an unbalanced binary tree implemented using ASTM, with values that have side-effecting constructors. Each non-empty node has astm::new to allocate its value so there are no dependencies, and abstracts programmers away from performing explicit reads and writes through the use of smart pointer syntax. Results are written to binary_tree.txt.
+
+unit_tests
+Unit tests covering core STM operations: read/write ordering, overwrites, arithmetic with local variables, future-based reads, and transaction retry logic on conflict. Results are written to unit_tests.txt.
+
+concurrency_tests
+Concurrency stress tests verifying atomicity under contention, including threads incrementing a shared integer and squaring transactions. Results are written to concurrency_test.txt. 
+
+## Prerequisites 
+
+- Legion installed
+- A C++17-compliant C++ compiler (e.g. GCC, Clang) and beyond
+- Boost, which path is set as `BOOST_ROOT` and incorporated into `LD_LIBRARY_PATH`
+
+### Build
+-----------------
+Repository depends on Legion 25.06.0
+
+Make sure to set $LEGION_ROOT to Legion install directory 
+
+```
+make
+```
+
+If you would like to rebulid, run  ```make clean``` before running ```make``` again. 
+
+### Run
+The program produces three executables:
+    - ```binary_tree``` from binary_tree.cpp , outputs  binary_tree.txt
+    - ```unit_tests``` from unit_tests.cpp, outputs unit_tests.txt
+    - ```concurrency_tests``` from concurrency_tests.cpp, outputs concurrency_test.txt
+```
+
+[astm.hpp]
+```cpp
+////////////////////////////////////////////////////////////////////////////////
+//  Copyright (c) 2014 Bryce Adelstein-Lelbach
+//  Copyright (c) 2014 Steve Brandt
+//
+//  Distributed under the Boost Software License, Version 1.0. (See accompanying
+//  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+////////////////////////////////////////////////////////////////////////////////
+
+#if !defined(ASTM_DBA88345_57B8_4CC8_A574_D5F007250E94)
+#define ASTM_DBA88345_57B8_4CC8_A574_D5F007250E94
+
+#include "legion.h"
+
+#include <list>
+#include <set>
+#include <map>
+#include <vector>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <future>
+#include <cassert>
+#include <fstream>
+
+// ---- Legion-specific ASTM configuration macros ----
+#define ASTM_MUTEX std::mutex
+#define ASTM_LOCK std::unique_lock<std::mutex>
+#define ASTM_FUNCTION std::function
+#define ASTM_TEST assert
+#define ASTM_REPORT 0
+
+namespace astm
+{
+
+// ---------------------------------------------------------------------------
+// Thread-local Legion runtime context.
+// Each Legion task entry point must call set_legion_context().
+// ---------------------------------------------------------------------------
+inline thread_local Legion::Runtime* tl_runtime  = nullptr;
+inline thread_local Legion::Context  tl_context  = {};
+
+inline void set_legion_context(Legion::Runtime* rt, Legion::Context ctx)
+{
+    tl_runtime = rt;
+    tl_context = ctx;
+}
+
+// ---------------------------------------------------------------------------
+// Chainable future – a lightweight future that supports .then() chaining
+// by accumulating work and executing it synchronously on .get().
+// This replaces both hpx::future and std::future in the ASTM internals.
+// ---------------------------------------------------------------------------
+struct chainable_future
+{
+    std::shared_ptr<std::function<void()>> chain_;
+
+    chainable_future()
+      : chain_(std::make_shared<std::function<void()>>([](){}))
+    {}
+
+    // Run the chain to completion.
+    void get()
+    {
+        if (chain_) (*chain_)();
+        // Reset so repeated get() is safe.
+        chain_ = std::make_shared<std::function<void()>>([](){});
+    }
+
+    // Append work after the current chain; returns a new future that
+    // represents the combined sequence.
+    template <typename F>
+    chainable_future then(F f)
+    {
+        auto prev = chain_;
+        chainable_future result;
+        result.chain_ = std::make_shared<std::function<void()>>(
+            [prev, f]() mutable {
+                if (prev) (*prev)();
+                f();
+            });
+        return result;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Async future – wraps std::future<void> so that ASTM_ASYNC callers can
+// collect futures and .get() them, while still providing real concurrency.
+// ---------------------------------------------------------------------------
+struct async_future
+{
+    std::shared_future<void> fut_;
+
+    async_future() : fut_() {}
+    async_future(std::future<void>&& f) : fut_(f.share()) {}
+    async_future(std::shared_future<void> f) : fut_(f) {}
+
+    void get() { if (fut_.valid()) fut_.get(); }
+};
+
+// ---------------------------------------------------------------------------
+// ASTM_FUTURE<void>  – used inside the STM for chaining.
+// ASTM_ASYNC_FUTURE  – used by callers that launch real concurrent work.
+// ---------------------------------------------------------------------------
+#define ASTM_FUTURE astm::chainable_future
+
+inline chainable_future ASTM_MAKE_READY_FUTURE()
+{
+    return chainable_future();
+}
+
+// Launch a callable asynchronously and return an async_future.
+template <typename F, typename... Args>
+async_future astm_async(F&& f, Args&&... args)
+{
+    return async_future(
+        std::async(std::launch::async,
+                   std::forward<F>(f),
+                   std::forward<Args>(args)...));
+}
+
+#define ASTM_ASYNC astm::astm_async
+
+// ---------------------------------------------------------------------------
+// shared_var_base – type-erased interface for transactional variables.
+// ---------------------------------------------------------------------------
+struct shared_var_base
+{
+    virtual ~shared_var_base() {}
+
+    virtual shared_var_base* clone() const = 0;
+
+    virtual void write(shared_var_base const&) = 0;
+
+    virtual ASTM_LOCK lock() const = 0;
+
+    virtual bool operator==(shared_var_base const&) const = 0;
+};
+
+struct transaction;
+
+// ---------------------------------------------------------------------------
+// transaction_future – allows scheduling deferred work inside a transaction.
+// ---------------------------------------------------------------------------
+struct transaction_future
+{
+    typedef chainable_future future_type;
+
+  private:
+    transaction* trans_;
+    future_type  fut_;
+
+  public:
+    transaction_future(transaction* trans)
+      : trans_(trans)
+      , fut_(ASTM_MAKE_READY_FUTURE())
+    {}
+
+    transaction_future(transaction& trans)
+      : trans_(&trans)
+      , fut_(ASTM_MAKE_READY_FUTURE())
+    {}
+
+    template <typename F>
+    void then(F f);
+
+    void get()
+    {
+        fut_.get();
+    }
+};
+
+// ---------------------------------------------------------------------------
+// shared_var<T> – a transactional variable holding a value of type T.
+// ---------------------------------------------------------------------------
+template <typename T>
+struct shared_var : shared_var_base
+{
+    typedef chainable_future future_type;
+
+    struct local_var
+    {
+      private:
+        transaction* trans_;
+        shared_var_base* var_;
+
+      public:
+        local_var(transaction* trans, shared_var_base* var)
+          : trans_(trans)
+          , var_(var)
+        {}
+
+        T get() const;
+
+        operator T const& () const;
+
+        local_var& operator=(shared_var_base const& rhs);
+
+        local_var& operator=(T const& rhs);
+
+        template <typename F>
+        void then(F f);
+    };
+
+  private:
+    T data_;
+    mutable ASTM_MUTEX mtx_;
+
+  public:
+    future_type queue;
+
+    shared_var() : data_(), mtx_(), queue(ASTM_MAKE_READY_FUTURE()) {}
+
+    shared_var(T const& t) : data_(t), mtx_(), queue(ASTM_MAKE_READY_FUTURE()) {}
+
+    shared_var(T&& t) : data_(t), mtx_(), queue(ASTM_MAKE_READY_FUTURE()) {}
+
+    shared_var(shared_var const& rhs) : data_(rhs.data_), mtx_(), queue(ASTM_MAKE_READY_FUTURE()) {}
+
+    ~shared_var() { }
+
+    // Locks.
+    shared_var_base* clone() const
+    {
+        auto l = lock();
+        return new shared_var(data_);
+    }
+
+    // Doesn't lock.
+    T const& read() const
+    {
+        return data_;
+    }
+
+    // Doesn't lock.
+    void write(T const& rhs)
+    {
+        data_ = rhs;
+    }
+
+    // Doesn't lock.
+    void write(shared_var_base const& rhs)
+    {
+        data_ = dynamic_cast<shared_var const*>(&rhs)->read();
+    }
+
+    ASTM_LOCK lock() const
+    {
+        return ASTM_LOCK(mtx_);
+    }
+
+    bool operator==(shared_var_base const& rhs) const
+    {
+        return data_ == dynamic_cast<shared_var const*>(&rhs)->read();
+    }
+
+    local_var get_local(transaction& trans)
+    {
+        return local_var(&trans, this);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// transaction – manages an optimistic STM transaction.
+// ---------------------------------------------------------------------------
+struct transaction
+{
+    std::list<
+        std::pair<
+            // The shared variable we're reading from
+            shared_var_base*
+            // The value we read from the variable
+          , std::shared_ptr<shared_var_base>
+        >
+    > read_list;
+
+    std::set<
+        shared_var_base* // The shared variable we're writing to
+    > write_set;
+
+    std::list<
+        std::pair<
+            chainable_future*             // The future we're writing to
+                                          // (if NULL, fire-and-forget semantics)
+          , ASTM_FUNCTION<void(transaction*)> // The async action to execute
+        >
+    > async_list;
+
+    std::map<
+        shared_var_base* // The shared variable we're reading from
+      , std::shared_ptr<shared_var_base> // Current value of the variable
+    > variables;
+
+    void clear()
+    {
+        read_list.clear();
+        write_set.clear();
+        async_list.clear();
+        variables.clear();
+    }
+
+    // Commit the transaction.  Returns true on success, false on conflict.
+    bool commit_transaction()
+    {
+        // Algorithm:
+        //
+        // 1.) Obtain exclusive access to all the variables.
+        // 2.) Compare our recorded reads against the current values (fail if needed).
+        // 3.) Perform writes, reading from our internal map.
+        // 4.) Perform async operations.
+        // 5.) Release exclusive access.
+
+        // 1.) Obtain exclusive access to all the variables.
+        std::list<ASTM_LOCK> locks;
+
+        // Variable map is sorted, so order of locking is sorted.
+        for ( std::pair<shared_var_base*, std::shared_ptr<shared_var_base> > const& var
+            : variables)
+        {
+            assert(var.first != NULL);
+
+            locks.push_back((*var.first).lock());
+        }
+
+        // 2.) Compare our recorded reads against the current values (fail if needed).
+        for ( std::pair<shared_var_base*, std::shared_ptr<shared_var_base> > const& var
+            : read_list)
+        {
+            assert(var.first != NULL);
+
+            if (!((*var.first) == (*var.second))) // Perform read operation.
+            {
+                clear();
+
+                // Transaction fails; exclusive access is released by RAII.
+                return false;
+            }
+        }
+
+        // 3.) Perform writes, reading from our internal map.
+        for (shared_var_base* var : write_set)
+        {
+            assert(var != NULL);
+
+            auto it = variables.find(var);
+
+            assert(it != variables.end());
+
+            (*var).write((*(*it).second)); // Perform write operation.
+        }
+
+        // 4.) Perform async operations.
+        for ( std::pair<chainable_future*, ASTM_FUNCTION<void(transaction*)> >& op
+            : async_list)
+        {
+            // If the future pointer is NULL, use fire-and-forget (run inline).
+            if (op.first == NULL)
+            {
+                op.second(this);
+            }
+            else
+            {
+                // Chain work onto the existing future.
+                auto bound = std::bind(op.second, this);
+                (*op.first) = (*op.first).then(bound);
+            }
+        }
+
+        // 5.) Release exclusive access (RAII – locks destroyed here).
+        return true;
+    }
+
+    shared_var_base const& read(shared_var_base* var)
+    {
+        assert(var != NULL);
+
+        std::pair<shared_var_base*, std::shared_ptr<shared_var_base> > entry(var, 0);
+
+        auto result = variables.insert(entry);
+
+        if (result.second == true)
+        {
+            // Insertion succeeded; this is the first read of the variable.
+            (*result.first).second.reset((*var).clone()); // Perform read.
+
+            // Record the read operation.
+            read_list.push_back(*result.first);
+
+            return (*(*result.first).second);
+        }
+        else
+            // Insertion failed; the variable is already in the internal state.
+            return (*(*result.first).second);
+    }
+
+    void write(shared_var_base* var, shared_var_base const& value)
+    {
+        assert(var != NULL);
+
+        std::pair<shared_var_base*, std::shared_ptr<shared_var_base> >
+            entry(var, std::shared_ptr<shared_var_base>(value.clone()));
+
+        auto result = variables.insert(entry);
+
+        if (result.second == true)
+        {
+            // Insertion succeeded; this is the first access of the variable.
+            write_set.insert(var);
+        }
+        else
+        {
+            // Insertion failed; the variable is already in the internal state.
+            (*result.first).second = entry.second; // Perform INTERNAL write.
+
+            write_set.insert(var);
+        }
+    }
+
+    // If fut is NULL, then fire-and-forget semantics are used.
+    void then(chainable_future* fut, ASTM_FUNCTION<void(transaction*)> F)
+    {
+        std::pair<chainable_future*, ASTM_FUNCTION<void(transaction*)> > entry(fut, F);
+        async_list.push_back(entry);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// shared_var<T>::local_var   out-of-line definitions
+// ---------------------------------------------------------------------------
+template <typename T>
+shared_var<T>::local_var::operator T const& () const
+{
+    return dynamic_cast<shared_var const*>(&trans_->read(var_))->read();
+}
+
+template <typename T>
+T shared_var<T>::local_var::get() const
+{
+    return dynamic_cast<shared_var const*>(&trans_->read(var_))->read();
+}
+
+template <typename T>
+typename shared_var<T>::local_var&
+shared_var<T>::local_var::operator=(shared_var_base const& rhs)
+{
+    trans_->write(var_, rhs);
+    return *this;
+}
+
+template <typename T>
+typename shared_var<T>::local_var&
+shared_var<T>::local_var::operator=(T const& rhs)
+{
+    shared_var tmp(rhs);
+    trans_->write(var_, tmp);
+    return *this;
+}
+
+template <typename T>
+template <typename F>
+void shared_var<T>::local_var::then(F f)
+{
+    assert(trans_);
+    trans_->then(&dynamic_cast<shared_var*>(var_)->queue, f);
+}
+
+template <typename F>
+void transaction_future::then(F f)
+{
+    assert(trans_);
+    trans_->then(&fut_, f);
+}
+
+// ---------------------------------------------------------------------------
+// Legion task registration helpers.
+//
+// Usage:
+//   1. Define your task body with the signature:
+//        void my_task(const Legion::Task*, ..., Legion::Context, Legion::Runtime*);
+//   2. Register it before Runtime::start():
+//        Legion::Runtime::register_task<my_task>(MY_TASK_ID);
+//   3. Inside a Legion task, launch work:
+//        astm::legion_launch(runtime, ctx, MY_TASK_ID);
+// ---------------------------------------------------------------------------
+
+// Launch a void Legion task and return an async_future that becomes ready
+// when the task completes.
+inline async_future legion_launch(Legion::Runtime* runtime,
+                                  Legion::Context  ctx,
+                                  Legion::TaskID   tid)
+{
+    Legion::TaskLauncher launcher(tid, Legion::TaskArgument(NULL, 0));
+    Legion::Future f = runtime->execute_task(ctx, launcher);
+    // Wrap the Legion::Future into an async_future via a blocking helper.
+    return async_future(
+        std::async(std::launch::deferred, [f]() mutable { f.get_void_result(); }));
+}
+
+// Launch a void Legion task with a serialisable argument pod.
+template <typename ArgT>
+inline async_future legion_launch(Legion::Runtime* runtime,
+                                  Legion::Context  ctx,
+                                  Legion::TaskID   tid,
+                                  ArgT const&      arg)
+{
+    Legion::TaskLauncher launcher(
+        tid,
+        Legion::TaskArgument(&arg, sizeof(ArgT)));
+    Legion::Future f = runtime->execute_task(ctx, launcher);
+    return async_future(
+        std::async(std::launch::deferred, [f]() mutable { f.get_void_result(); }));
+}
+
+} // namespace astm
+
+#endif // ASTM_DBA88345_57B8_4CC8_A574_D5F007250E94
+```
+
+[astm_config.hpp]
+```cpp
+////////////////////////////////////////////////////////////////////////////////
+//  Copyright (c) 2014 Bryce Adelstein-Lelbach
+//  Copyright (c) 2014 Steve Brandt 
+//
+//  Distributed under the Boost Software License, Version 1.0. (See accompanying
+//  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+////////////////////////////////////////////////////////////////////////////////
+
+#if !defined(ASTM_DBA88345_57B8_4CC8_A574_D5F007250E95)
+#define ASTM_DBA88345_57B8_4CC8_A574_D5F007250E95
+
+#if defined(ASTM_LEGION)
+    #include "legion.h"
+
+    #include <future>
+    #include <thread>
+    #include <mutex>
+    #include <functional>
+    #include <memory>
+    #include <cassert>
+
+    // Legion manages coherence via regions, but the STM library requires
+    // fine-grained local locking for its commit protocol, so we use std::mutex.
+    #define ASTM_MUTEX std::mutex
+    #define ASTM_LOCK std::unique_lock<std::mutex>
+    #define ASTM_FUNCTION std::function
+
+    namespace astm { namespace detail {
+
+    // Legion's Future<T> does not natively support .then() continuation
+    // chaining. We provide a lightweight chainable future built on top of
+    // std::shared_future that supports the .then() interface required by ASTM's
+    // commit_transaction() and transaction_future.
+    template <typename T>
+    class chainable_future;
+
+    template <>
+    class chainable_future<void>
+    {
+        std::shared_future<void> fut_;
+
+    public:
+        chainable_future()
+          : fut_()
+        {}
+
+        chainable_future(std::future<void>&& f)
+          : fut_(f.share())
+        {}
+
+        chainable_future(std::shared_future<void> f)
+          : fut_(std::move(f))
+        {}
+
+        chainable_future(chainable_future&&) = default;
+        chainable_future(chainable_future const&) = default;
+        chainable_future& operator=(chainable_future&&) = default;
+        chainable_future& operator=(chainable_future const&) = default;
+
+        void get()
+        {
+            if (fut_.valid())
+                fut_.get();
+        }
+
+        // .then(F) waits for this future to become ready, then invokes F(),
+        // and returns a new chainable_future representing completion of F.
+        // This mirrors hpx::future<void>::then() as used by the ASTM library,
+        // where continuations are always void()->void callables produced by
+        // std::bind.
+        template <typename F>
+        chainable_future<void> then(F&& f)
+        {
+            std::shared_future<void> captured = fut_;
+            std::function<void()> func(std::forward<F>(f));
+            return chainable_future<void>(
+                std::async(std::launch::async,
+                    [captured, func]()
+                    {
+                        if (captured.valid())
+                            captured.get();
+                        func();
+                    })
+            );
+        }
+    };
+
+    // Creates an immediately-ready chainable_future<void>.
+    inline chainable_future<void> make_ready()
+    {
+        std::promise<void> p;
+        p.set_value();
+        return chainable_future<void>(p.get_future());
+    }
+
+    // Launches an asynchronous operation and returns a chainable_future<void>.
+    // This replaces hpx::async in the Legion execution model.
+    template <typename F, typename... Args>
+    inline chainable_future<void> async_launch(F&& f, Args&&... args)
+    {
+        return chainable_future<void>(
+            std::async(std::launch::async,
+                       std::forward<F>(f),
+                       std::forward<Args>(args)...)
+        );
+    }
+
+    }} // namespace astm::detail
+
+    #define ASTM_FUTURE astm::detail::chainable_future
+    #define ASTM_ASYNC astm::detail::async_launch
+    #define ASTM_MAKE_READY_FUTURE astm::detail::make_ready
+
+    #define ASTM_TEST assert
+    #define ASTM_REPORT 0
+
+#elif defined(ASTM_HPX) // Use hpx::
+    #include <hpx/include/lcos.hpp>
+    #include <hpx/async.hpp>
+    #include <hpx/synchronization/spinlock_pool.hpp>
+    #define ASTM_MUTEX hpx::util::spinlock
+    //std shared lock mimicry 
+    #define ASTM_LOCK std::unique_lock<ASTM_MUTEX> 
+    #define ASTM_FUTURE hpx::future
+    #define ASTM_FUNCTION std::function
+    #define ASTM_ASYNC hpx::async
+    #define ASTM_MAKE_READY_FUTURE hpx::make_ready_future
+
+    #include <hpx/util/lightweight_test.hpp>
+
+    #define ASTM_TEST HPX_TEST
+    #define ASTM_REPORT hpx::util::report_errors()
+#else                 // Use std::
+    #include <future>
+    #include <thread>
+    #include <mutex> 
+    #include <functional>
+
+    #define ASTM_MUTEX std::mutex
+    #define ASTM_LOCK std::unique_lock<std::mutex> 
+    #define ASTM_FUTURE std::future
+    #define ASTM_FUNCTION std::function
+    #define ASTM_ASYNC std::async
+
+    // Note: this is a hack, no make_ready_future in std::
+    #define ASTM_MAKE_READY_FUTURE std::async([](){})
+
+    #include <assert.h>
+
+    #define ASTM_TEST assert
+    #define ASTM_REPORT 0 
+#endif 
+
+#endif // ASTM_DBA88345_57B8_4CC8_A574_D5F007250E95
+
+//newer ASTM 
+#if !defined(ASTM_65EB3381_65AE_4527_A4E5_A87D5014A33E)
+#define ASTM_65EB3381_65AE_4527_A4E5_A87D5014A33E
+
+#include "astm.hpp"
+
+namespace astm
+{
+}
+
+#endif
+```
+
+[binary_tree.cpp]
+```cpp
+////////////////////////////////////////////////////////////////////////////////
+//  Copyright (c) 2014 Bryce Adelstein-Lelbach
+//  Copyright (c) 2014 Steve Brandt 
+//
+//  Distributed under the Boost Software License, Version 1.0. (See accompanying
+//  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+////////////////////////////////////////////////////////////////////////////////
+
+#include "legion.h"
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <cstring>
+#include <functional>
+#include <cassert>
+
+using namespace Legion;
+
+// Constants
+static const int MAX_NODES = 128;
+static const int MAX_VALUE_LEN = 64;
+static const int NULL_IDX = -1;
+
+// Fixed-size value type for storing strings in a Legion region field
+struct NodeValue {
+    char data[MAX_VALUE_LEN];
+};
+
+// Field IDs for tree node fields stored in the logical region
+enum FieldIDs {
+    FID_KEY,
+    FID_VALUE,
+    FID_LEFT,
+    FID_RIGHT,
+};
+
+// Task IDs
+enum TaskIDs {
+    TOP_LEVEL_TASK_ID,
+};
+
+void top_level_task(const Task *task,
+                    const std::vector<PhysicalRegion> &regions,
+                    Context ctx, Runtime *runtime)
+{
+    // Open output file
+    std::ofstream outfile("binary_tree.txt");
+    if (!outfile.is_open()) {
+        std::cerr << "Failed to open binary_tree.txt for writing." << std::endl;
+        return;
+    }
+
+    // Create a logical region to store tree nodes.
+    // Each node occupies one entry in the region, indexed by an integer.
+    // Node pointers (left/right children) are represented as integer indices
+    // into this region, with NULL_IDX (-1) representing a null pointer.
+    // This replaces the original shared_var<node*> pattern from the STM model.
+    Rect<1> node_rect(0, MAX_NODES - 1);
+    IndexSpace is = runtime->create_index_space(ctx, node_rect);
+    FieldSpace fs = runtime->create_field_space(ctx);
+    {
+        FieldAllocator fa = runtime->create_field_allocator(ctx, fs);
+        fa.allocate_field(sizeof(int), FID_KEY);
+        fa.allocate_field(sizeof(NodeValue), FID_VALUE);
+        fa.allocate_field(sizeof(int), FID_LEFT);
+        fa.allocate_field(sizeof(int), FID_RIGHT);
+    }
+    LogicalRegion tree_lr = runtime->create_logical_region(ctx, is, fs);
+
+    // Inline map the region for read/write access.
+    // In the original code, each insert/search was wrapped in a transaction
+    // (do { ... } while (!t.commit_transaction())).  In Legion, the runtime
+    // guarantees coherent, exclusive access through the region requirement,
+    // so no retry loop is needed.
+    RegionRequirement req(tree_lr, READ_WRITE, EXCLUSIVE, tree_lr);
+    req.add_field(FID_KEY);
+    req.add_field(FID_VALUE);
+    req.add_field(FID_LEFT);
+    req.add_field(FID_RIGHT);
+    InlineLauncher il(req);
+    PhysicalRegion pr = runtime->map_region(ctx, il);
+    pr.wait_until_valid();
+
+    const FieldAccessor<READ_WRITE, int, 1> acc_key(pr, FID_KEY);
+    const FieldAccessor<READ_WRITE, NodeValue, 1> acc_value(pr, FID_VALUE);
+    const FieldAccessor<READ_WRITE, int, 1> acc_left(pr, FID_LEFT);
+    const FieldAccessor<READ_WRITE, int, 1> acc_right(pr, FID_RIGHT);
+
+    // Initialize all node slots
+    for (int i = 0; i < MAX_NODES; i++) {
+        acc_key[i] = 0;
+        NodeValue empty_val;
+        memset(empty_val.data, 0, MAX_VALUE_LEN);
+        acc_value[i] = empty_val;
+        acc_left[i] = NULL_IDX;
+        acc_right[i] = NULL_IDX;
+    }
+
+    // Tree state: replaces the shared_var<node*> root member of binary_tree
+    int next_free = 0;
+    int root_idx = NULL_IDX;
+
+    // Allocate a new node in the region (replaces `new node(key, value)`)
+    auto alloc_node = [&](int key, const std::string& value) -> int {
+        assert(next_free < MAX_NODES);
+        int idx = next_free++;
+        acc_key[idx] = key;
+        NodeValue nv;
+        memset(nv.data, 0, MAX_VALUE_LEN);
+        strncpy(nv.data, value.c_str(), MAX_VALUE_LEN - 1);
+        acc_value[idx] = nv;
+        acc_left[idx] = NULL_IDX;
+        acc_right[idx] = NULL_IDX;
+        return idx;
+    };
+
+    // Recursive insert helper
+    // Replaces the private insert(Key, Value, shared_var<node*>&, transaction&)
+    std::function<void(int, const std::string&, int)> insert_at;
+    insert_at = [&](int key, const std::string& value, int leaf_idx) {
+        if (key < acc_key[leaf_idx]) {
+            int left = acc_left[leaf_idx];
+            if (left != NULL_IDX)
+                insert_at(key, value, left);
+            else
+                acc_left[leaf_idx] = alloc_node(key, value);
+        } else { // key >= leaf key (matches original >= branch)
+            int right = acc_right[leaf_idx];
+            if (right != NULL_IDX)
+                insert_at(key, value, right);
+            else
+                acc_right[leaf_idx] = alloc_node(key, value);
+        }
+    };
+
+    // Insert a key-value pair into the tree
+    // Replaces binary_tree::insert which wrapped work in a transaction
+    auto insert = [&](int key, const std::string& value) {
+        if (root_idx == NULL_IDX) {
+            root_idx = alloc_node(key, value);
+        } else {
+            insert_at(key, value, root_idx);
+        }
+    };
+
+    // Recursive search helper
+    // Replaces the private search(Key, shared_var<node*>&, transaction&)
+    std::function<int(int, int)> search_at;
+    search_at = [&](int key, int node_idx) -> int {
+        if (node_idx == NULL_IDX) return NULL_IDX;
+        int node_key = acc_key[node_idx];
+        if (key == node_key) return node_idx;
+        if (key < node_key)
+            return search_at(key, acc_left[node_idx]);
+        else
+            return search_at(key, acc_right[node_idx]);
+    };
+
+    // Search for a key in the tree, returns node index or NULL_IDX
+    // Replaces binary_tree::search which wrapped work in a transaction
+    auto search = [&](int key) -> int {
+        return search_at(key, root_idx);
+    };
+
+    // ===================================================================
+    // Main logic (matches original main() body)
+    // ===================================================================
+    {
+        // 1. Data Insertion Phase
+        struct DataEntry {
+            int id;
+            std::string val;
+        };
+
+        std::vector<DataEntry> data = {
+            {50, "Root Node"},
+            {30, "Left Child"},
+            {70, "Right Child"},
+            {20, "Left-Left Grandchild"},
+            {40, "Left-Right Grandchild"},
+            {60, "Right-Left Grandchild"},
+            {80, "Right-Right Grandchild"}
+        };
+
+        outfile << "Inserting Data:\n";
+        for (const auto& entry : data) {
+            outfile << "  Insert(Key: " << entry.id
+                    << ", Value: \"" << entry.val << "\")" << std::endl;
+            insert(entry.id, entry.val);
+        }
+        outfile << "\n";
+
+        // 2. Search Test Phase
+        outfile << "Running Search Tests:\n";
+
+        auto perform_search = [&](int search_key) {
+            outfile << "  Search(Key: " << search_key << ") -> ";
+
+            int idx = search(search_key);
+
+            if (idx != NULL_IDX) {
+                NodeValue nv = acc_value[idx];
+                outfile << "Found! Result Value: \""
+                        << nv.data << "\"\n";
+            } else {
+                outfile << "Not Found.\n";
+            }
+        };
+
+        perform_search(99);
+        perform_search(10);
+        perform_search(50);
+        perform_search(20);
+        perform_search(60);
+        perform_search(80);
+        perform_search(45);
+    }
+
+    outfile.close();
+
+    // Cleanup Legion resources
+    runtime->unmap_region(ctx, pr);
+    runtime->destroy_logical_region(ctx, tree_lr);
+    runtime->destroy_field_space(ctx, fs);
+    runtime->destroy_index_space(ctx, is);
+}
+
+int main(int argc, char **argv)
+{
+    Runtime::set_top_level_task_id(TOP_LEVEL_TASK_ID);
+
+    {
+        TaskVariantRegistrar registrar(TOP_LEVEL_TASK_ID, "top_level");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        Runtime::preregister_task_variant<top_level_task>(registrar, "top_level");
+    }
+
+    return Runtime::start(argc, argv);
+}
+```
+
+[concurrency_tests.cpp]
+```cpp
+////////////////////////////////////////////////////////////////////////////////
+//  Copyright (c) 2014 Bryce Adelstein-Lelbach
+//  Copyright (c) 2014 Steve Brandt
+//
+//  Distributed under the Boost Software License, Version 1.0. (See accompanying
+//  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+////////////////////////////////////////////////////////////////////////////////
+
+#include "legion.h"
+#include <iostream>
+#include <fstream>
+
+using namespace Legion;
+
+enum {
+    TOP_LEVEL_TASK_ID,
+    INCREMENT_TASK_ID,
+    SQUARE_TASK_ID,
+};
+
+enum {
+    FID_VALUE,
+};
+
+// A = A + 1
+// Legion serializes tasks with READ_WRITE on the same region,
+// replacing the STM commit/retry loop.
+void increment_task(const Task *task,
+                    const std::vector<PhysicalRegion> &regions,
+                    Context ctx, Runtime *runtime)
+{
+    const FieldAccessor<READ_WRITE, int, 1> acc(regions[0], FID_VALUE);
+    int val = acc[0];
+    acc[0] = val + 1;
+}
+
+// A = A * A
+void square_task(const Task *task,
+                 const std::vector<PhysicalRegion> &regions,
+                 Context ctx, Runtime *runtime)
+{
+    const FieldAccessor<READ_WRITE, int, 1> acc(regions[0], FID_VALUE);
+    int val = acc[0];
+    acc[0] = val * val;
+}
+
+void top_level_task(const Task *task,
+                    const std::vector<PhysicalRegion> &regions,
+                    Context ctx, Runtime *runtime)
+{
+    // Open output file
+    std::ofstream outfile("concurrency_tests.txt");
+    if (!outfile.is_open()) {
+        std::cerr << "Failed to open concurrency_tests.txt" << std::endl;
+        return;
+    }
+
+    // ---------------------------------------------------------
+    // TEST 1: High Concurrency Increment
+    // Goal: Ensure 64 tasks can atomically increment a shared
+    //       variable without data loss.
+    // ---------------------------------------------------------
+    {
+        outfile << "Concurrency Increment Test\n";
+        outfile << "  Initial Value: 0\n";
+        outfile << "  Threads: 64\n";
+        outfile << "  Operation: A = A + 1\n";
+
+        // Create a single-element logical region for shared_var<int> A(0)
+        Rect<1> rect(0, 0);
+        IndexSpace is = runtime->create_index_space(ctx, rect);
+        FieldSpace fs = runtime->create_field_space(ctx);
+        {
+            FieldAllocator fa = runtime->create_field_allocator(ctx, fs);
+            fa.allocate_field(sizeof(int), FID_VALUE);
+        }
+        LogicalRegion lr = runtime->create_logical_region(ctx, is, fs);
+
+        // Initialize A to 0
+        runtime->fill_field(ctx, lr, lr, FID_VALUE, 0);
+
+        // Launch 64 async increment tasks (analogous to ASTM_ASYNC).
+        // All tasks require READ_WRITE on the same region, so the
+        // Legion runtime serializes them — exactly like the STM's
+        // optimistic-retry mechanism, but without retries.
+        for (unsigned i = 0; i < 64; ++i) {
+            TaskLauncher launcher(INCREMENT_TASK_ID, TaskArgument(NULL, 0));
+            launcher.add_region_requirement(
+                RegionRequirement(lr, READ_WRITE, EXCLUSIVE, lr));
+            launcher.region_requirements[0].add_field(FID_VALUE);
+            runtime->execute_task(ctx, launcher);
+        }
+
+        // Read the result after all increment tasks have completed.
+        // The inline mapping implicitly waits for all prior writers.
+        RegionRequirement read_req(lr, READ_ONLY, EXCLUSIVE, lr);
+        read_req.add_field(FID_VALUE);
+        InlineLauncher il(read_req);
+        PhysicalRegion pr = runtime->map_region(ctx, il);
+        pr.wait_until_valid();
+        const FieldAccessor<READ_ONLY, int, 1> acc(pr, FID_VALUE);
+        int result = acc[0];
+        runtime->unmap_region(ctx, pr);
+
+        outfile << "  Expected Result: 64\n";
+        outfile << "  Actual Result:   " << result << "\n";
+        outfile << "  Status: " << (result == 64 ? "PASS" : "FAIL") << "\n\n";
+
+        // Clean up
+        runtime->destroy_logical_region(ctx, lr);
+        runtime->destroy_field_space(ctx, fs);
+        runtime->destroy_index_space(ctx, is);
+    }
+
+    // ---------------------------------------------------------
+    // TEST 2: Exponential Growth (The 'cubeA' logic)
+    // Goal: Test logic where the write depends heavily on the
+    //       read value.
+    // We start at 2 and run 4 iterations:
+    //   2 -> 4 -> 16 -> 256 -> 65536
+    // ---------------------------------------------------------
+    {
+        outfile << "Exponential Growth (Squaring) Test\n";
+        outfile << "  Initial Value: 2\n";
+        outfile << "  Threads: 4\n";
+        outfile << "  Operation: A = A * A\n";
+
+        // Create a single-element logical region for shared_var<int> A(2)
+        Rect<1> rect(0, 0);
+        IndexSpace is = runtime->create_index_space(ctx, rect);
+        FieldSpace fs = runtime->create_field_space(ctx);
+        {
+            FieldAllocator fa = runtime->create_field_allocator(ctx, fs);
+            fa.allocate_field(sizeof(int), FID_VALUE);
+        }
+        LogicalRegion lr = runtime->create_logical_region(ctx, is, fs);
+
+        // Initialize A to 2
+        runtime->fill_field(ctx, lr, lr, FID_VALUE, 2);
+
+        // Launch 4 async squaring tasks.
+        // READ_WRITE serializes them in launch order:
+        //   2 -> 4 -> 16 -> 256 -> 65536
+        for (unsigned i = 0; i < 4; ++i) {
+            TaskLauncher launcher(SQUARE_TASK_ID, TaskArgument(NULL, 0));
+            launcher.add_region_requirement(
+                RegionRequirement(lr, READ_WRITE, EXCLUSIVE, lr));
+            launcher.region_requirements[0].add_field(FID_VALUE);
+            runtime->execute_task(ctx, launcher);
+        }
+
+        // Read the result
+        RegionRequirement read_req(lr, READ_ONLY, EXCLUSIVE, lr);
+        read_req.add_field(FID_VALUE);
+        InlineLauncher il(read_req);
+        PhysicalRegion pr = runtime->map_region(ctx, il);
+        pr.wait_until_valid();
+        const FieldAccessor<READ_ONLY, int, 1> acc(pr, FID_VALUE);
+        int result = acc[0];
+        runtime->unmap_region(ctx, pr);
+
+        outfile << "  Expected Result: 65536\n";
+        outfile << "  Actual Result:   " << result << "\n";
+        outfile << "  Status: " << (result == 65536 ? "PASS" : "FAIL") << "\n";
+
+        // Clean up
+        runtime->destroy_logical_region(ctx, lr);
+        runtime->destroy_field_space(ctx, fs);
+        runtime->destroy_index_space(ctx, is);
+    }
+
+    outfile.close();
+}
+
+int main(int argc, char **argv)
+{
+    Runtime::set_top_level_task_id(TOP_LEVEL_TASK_ID);
+
+    {
+        TaskVariantRegistrar registrar(TOP_LEVEL_TASK_ID, "top_level");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        Runtime::preregister_task_variant<top_level_task>(registrar, "top_level");
+    }
+    {
+        TaskVariantRegistrar registrar(INCREMENT_TASK_ID, "increment");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        Runtime::preregister_task_variant<increment_task>(registrar, "increment");
+    }
+    {
+        TaskVariantRegistrar registrar(SQUARE_TASK_ID, "square");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        Runtime::preregister_task_variant<square_task>(registrar, "square");
+    }
+
+    return Runtime::start(argc, argv);
+}
+```
+
+[unit_tests.cpp]
+```cpp
+////////////////////////////////////////////////////////////////////////////////
+//  Copyright (c) 2014 Bryce Adelstein-Lelbach
+//  Copyright (c) 2014 Steve Brandt
+//
+//  Distributed under the Boost Software License, Version 1.0. (See accompanying
+//  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+////////////////////////////////////////////////////////////////////////////////
+
+#include "legion.h"
+#include <iostream>
+#include <fstream>
+#include <cassert>
+
+using namespace Legion;
+
+enum FieldIDs {
+    FID_VAL = 0,
+};
+
+enum TaskIDs {
+    TOP_LEVEL_TASK_ID,
+    CHECK_VALUE_TASK_ID,
+};
+
+// ---------------------------------------------------------------------------
+// Helper: create a logical region holding a single int, initialized to init_val
+// ---------------------------------------------------------------------------
+LogicalRegion create_int_var(Context ctx, Runtime *runtime, int init_val)
+{
+    IndexSpace is = runtime->create_index_space(ctx, Rect<1>(0, 0));
+    FieldSpace fs = runtime->create_field_space(ctx);
+    {
+        FieldAllocator fa = runtime->create_field_allocator(ctx, fs);
+        fa.allocate_field(sizeof(int), FID_VAL);
+    }
+    LogicalRegion lr = runtime->create_logical_region(ctx, is, fs);
+
+    RegionRequirement req(lr, WRITE_DISCARD, EXCLUSIVE, lr);
+    req.add_field(FID_VAL);
+    InlineLauncher il(req);
+    PhysicalRegion pr = runtime->map_region(ctx, il);
+    pr.wait_until_valid();
+    const FieldAccessor<WRITE_DISCARD, int, 1> acc(pr, FID_VAL);
+    acc[0] = init_val;
+    runtime->unmap_region(ctx, pr);
+
+    return lr;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: read the single int value from a region
+// ---------------------------------------------------------------------------
+int read_int_var(Context ctx, Runtime *runtime, LogicalRegion lr)
+{
+    RegionRequirement req(lr, READ_ONLY, EXCLUSIVE, lr);
+    req.add_field(FID_VAL);
+    InlineLauncher il(req);
+    PhysicalRegion pr = runtime->map_region(ctx, il);
+    pr.wait_until_valid();
+    const FieldAccessor<READ_ONLY, int, 1> acc(pr, FID_VAL);
+    int val = acc[0];
+    runtime->unmap_region(ctx, pr);
+    return val;
+}
+
+// ---------------------------------------------------------------------------
+// Helper: write a single int value into a region
+// ---------------------------------------------------------------------------
+void write_int_var(Context ctx, Runtime *runtime, LogicalRegion lr, int val)
+{
+    RegionRequirement req(lr, WRITE_DISCARD, EXCLUSIVE, lr);
+    req.add_field(FID_VAL);
+    InlineLauncher il(req);
+    PhysicalRegion pr = runtime->map_region(ctx, il);
+    pr.wait_until_valid();
+    const FieldAccessor<WRITE_DISCARD, int, 1> acc(pr, FID_VAL);
+    acc[0] = val;
+    runtime->unmap_region(ctx, pr);
+}
+
+// ---------------------------------------------------------------------------
+// Helper: destroy a logical region and its index/field spaces
+// ---------------------------------------------------------------------------
+void destroy_var(Context ctx, Runtime *runtime, LogicalRegion lr)
+{
+    IndexSpace is = lr.get_index_space();
+    FieldSpace fs = lr.get_field_space();
+    runtime->destroy_logical_region(ctx, lr);
+    runtime->destroy_field_space(ctx, fs);
+    runtime->destroy_index_space(ctx, is);
+}
+
+// ---------------------------------------------------------------------------
+// check_value_task: receives an int via TaskArgument, asserts it equals 16.
+// Equivalent to the IO.then() lambda in the original ASTM code.
+// ---------------------------------------------------------------------------
+void check_value_task(const Task *task,
+                      const std::vector<PhysicalRegion> &regions,
+                      Context ctx, Runtime *runtime)
+{
+    assert(task->arglen == sizeof(int));
+    int val = *(const int *)task->args;
+    assert(val == 16);
+}
+
+// ---------------------------------------------------------------------------
+// top_level_task – runs all unit tests sequentially
+// ---------------------------------------------------------------------------
+void top_level_task(const Task *task,
+                    const std::vector<PhysicalRegion> &regions,
+                    Context ctx, Runtime *runtime)
+{
+    std::ofstream outfile("unit_tests.txt");
+    if (!outfile.is_open()) {
+        std::cerr << "Could not open unit_tests.txt" << std::endl;
+        return;
+    }
+
+    { // Read A, Write A
+        // Original: shared_var<int> A(1); transaction { A_ = 2; } → A = 2
+        LogicalRegion A_lr = create_int_var(ctx, runtime, 1);
+
+        // Transaction equivalent: read A, then write A = 2
+        {
+            RegionRequirement req(A_lr, READ_WRITE, EXCLUSIVE, A_lr);
+            req.add_field(FID_VAL);
+            InlineLauncher il(req);
+            PhysicalRegion pr = runtime->map_region(ctx, il);
+            pr.wait_until_valid();
+            const FieldAccessor<READ_WRITE, int, 1> acc(pr, FID_VAL);
+            // implicit read of acc[0] (= 1), then write
+            acc[0] = 2;
+            runtime->unmap_region(ctx, pr);
+        }
+
+        outfile << "Test (Read A, Write A): A = "
+                << read_int_var(ctx, runtime, A_lr) << std::endl;
+        destroy_var(ctx, runtime, A_lr);
+    }
+
+    { // Write A, Read A
+        // Original: shared_var<int> A(1); transaction { A_ = 2; } → A = 2
+        LogicalRegion A_lr = create_int_var(ctx, runtime, 1);
+
+        {
+            RegionRequirement req(A_lr, READ_WRITE, EXCLUSIVE, A_lr);
+            req.add_field(FID_VAL);
+            InlineLauncher il(req);
+            PhysicalRegion pr = runtime->map_region(ctx, il);
+            pr.wait_until_valid();
+            const FieldAccessor<READ_WRITE, int, 1> acc(pr, FID_VAL);
+            acc[0] = 2;
+            runtime->unmap_region(ctx, pr);
+        }
+
+        outfile << "Test (Write A, Read A): A = "
+                << read_int_var(ctx, runtime, A_lr) << std::endl;
+        destroy_var(ctx, runtime, A_lr);
+    }
+
+    { // Write A, Write A  (actually reads A and asserts twice)
+        // Original: shared_var<int> A(1); transaction { assert(A_==1); assert(A_==1); }
+        LogicalRegion A_lr = create_int_var(ctx, runtime, 1);
+
+        {
+            int val = read_int_var(ctx, runtime, A_lr);
+            assert(val == 1);
+            assert(val == 1);
+        }
+
+        outfile << "Test (Write A, Write A): A = "
+                << read_int_var(ctx, runtime, A_lr) << std::endl;
+        destroy_var(ctx, runtime, A_lr);
+    }
+
+    { // Write A, Write A (overwrite)
+        // Original: shared_var<int> A(1); transaction { A_ = 2; A_ = 2; } → A = 2
+        LogicalRegion A_lr = create_int_var(ctx, runtime, 1);
+
+        write_int_var(ctx, runtime, A_lr, 2);
+        write_int_var(ctx, runtime, A_lr, 2);
+
+        outfile << "Test (Overwrite): A = "
+                << read_int_var(ctx, runtime, A_lr) << std::endl;
+        destroy_var(ctx, runtime, A_lr);
+    }
+
+    { // Read A, Write A, Read A
+        // Original: shared_var<int> A(1); transaction { A_ = 2; } → A = 2
+        LogicalRegion A_lr = create_int_var(ctx, runtime, 1);
+
+        write_int_var(ctx, runtime, A_lr, 2);
+
+        outfile << "Test (Read -> Write -> Read): A = "
+                << read_int_var(ctx, runtime, A_lr) << std::endl;
+        destroy_var(ctx, runtime, A_lr);
+    }
+
+    { // Write A, Read A, Write A
+        // Original: shared_var<int> A(1); transaction { A_ = 2; A_ = 2; } → A = 2
+        LogicalRegion A_lr = create_int_var(ctx, runtime, 1);
+
+        write_int_var(ctx, runtime, A_lr, 2);
+        write_int_var(ctx, runtime, A_lr, 2);
+
+        outfile << "Test (Write -> Read -> Write): A = "
+                << read_int_var(ctx, runtime, A_lr) << std::endl;
+        destroy_var(ctx, runtime, A_lr);
+    }
+
+    { // Basic arithmetic with local_vars
+        // Original: A=4, B=1; transaction { A_ = A_*A_ - B_; } → A = 15, B = 1
+        LogicalRegion A_lr = create_int_var(ctx, runtime, 4);
+        LogicalRegion B_lr = create_int_var(ctx, runtime, 1);
+
+        {
+            int A_val = read_int_var(ctx, runtime, A_lr);
+            int B_val = read_int_var(ctx, runtime, B_lr);
+            write_int_var(ctx, runtime, A_lr, A_val * A_val - B_val);
+        }
+
+        outfile << "Test (Arithmetic): A = " << read_int_var(ctx, runtime, A_lr)
+                << ", B = " << read_int_var(ctx, runtime, B_lr) << std::endl;
+        destroy_var(ctx, runtime, A_lr);
+        destroy_var(ctx, runtime, B_lr);
+    }
+
+    { // Read A to future
+        // Original: A=4, B=1; transaction { A_=A_*A_; IO.then(check A==16);
+        //           A_=A_-B_; }  IO.get(); → A = 15, B = 1
+        LogicalRegion A_lr = create_int_var(ctx, runtime, 4);
+        LogicalRegion B_lr = create_int_var(ctx, runtime, 1);
+
+        int A_val = read_int_var(ctx, runtime, A_lr);
+        int B_val = read_int_var(ctx, runtime, B_lr);
+
+        A_val = A_val * A_val;   // A intermediate = 16
+        int local_A = A_val;     // Capture intermediate for async check
+
+        // Launch async check task (equivalent to IO.then)
+        TaskLauncher check_launcher(CHECK_VALUE_TASK_ID,
+                                    TaskArgument(&local_A, sizeof(local_A)));
+        Future f = runtime->execute_task(ctx, check_launcher);
+
+        A_val = A_val - B_val;   // A final = 15
+        write_int_var(ctx, runtime, A_lr, A_val);
+
+        // Wait for async check to complete (equivalent to IO.get())
+        f.get_void_result();
+
+        outfile << "Test (Read A to Future): A = "
+                << read_int_var(ctx, runtime, A_lr)
+                << ", B = " << read_int_var(ctx, runtime, B_lr) << std::endl;
+        destroy_var(ctx, runtime, A_lr);
+        destroy_var(ctx, runtime, B_lr);
+    }
+
+    { // Retry Logic
+        // Original: A=4; transaction attempt 1: read A=4, tmp=16, external
+        // write A=3, commit fails (read mismatch). Attempt 2: read A=3,
+        // tmp=9, commit succeeds. → A = 9, Attempts = 2.
+        //
+        // Legion has no optimistic-concurrency retry, so we model the
+        // validation-based retry explicitly: snapshot the value, perform
+        // the computation, re-read to validate, and retry on mismatch.
+        LogicalRegion A_lr = create_int_var(ctx, runtime, 4);
+
+        bool fail = true;
+        int attempt_count = 0;
+        bool committed = false;
+
+        while (!committed) {
+            ++attempt_count;
+
+            // Snapshot the current value (equivalent to transactional read)
+            int A_val = read_int_var(ctx, runtime, A_lr);
+            int snapshot = A_val;
+            int tmp = A_val * A_val;
+
+            if (fail) {
+                // Simulate an external concurrent write that causes conflict
+                write_int_var(ctx, runtime, A_lr, 3);
+                fail = false;
+            }
+
+            // Validate: re-read and compare against snapshot
+            int current = read_int_var(ctx, runtime, A_lr);
+            if (current == snapshot) {
+                // No conflict detected – commit the write
+                write_int_var(ctx, runtime, A_lr, tmp);
+                committed = true;
+            }
+            // else: conflict detected, loop retries
+        }
+
+        outfile << "Test (Retry Logic): A = "
+                << read_int_var(ctx, runtime, A_lr)
+                << ", Attempts = " << attempt_count << std::endl;
+        destroy_var(ctx, runtime, A_lr);
+    }
+
+    outfile.close();
+}
+
+// ---------------------------------------------------------------------------
+// main – register tasks and start the Legion runtime
+// ---------------------------------------------------------------------------
+int main(int argc, char **argv)
+{
+    Runtime::set_top_level_task_id(TOP_LEVEL_TASK_ID);
+
+    {
+        TaskVariantRegistrar registrar(TOP_LEVEL_TASK_ID, "top_level");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        Runtime::preregister_task_variant<top_level_task>(registrar, "top_level");
+    }
+
+    {
+        TaskVariantRegistrar registrar(CHECK_VALUE_TASK_ID, "check_value");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        Runtime::preregister_task_variant<check_value_task>(registrar, "check_value");
+    }
+
+    return Runtime::start(argc, argv);
+}
+```

@@ -1,0 +1,20 @@
+{
+  "iteration": 1,
+  "input_tokens": 16020,
+  "output_tokens": 47669,
+  "request_count": 1,
+  "generation_time_s": 745.059,
+  "build_status": false,
+  "run_status": false,
+  "overall_status": "BUILD_FAIL",
+  "per_file_status": {
+    "odeint.txt": "BUILD_FAIL"
+  },
+  "build_dictionary": {
+    "build_returncode": 1,
+    "build_stdout": "-- The CXX compiler identification is GNU 14.3.0\n-- Detecting CXX compiler ABI info\n-- Detecting CXX compiler ABI info - done\n-- Check for working CXX compiler: /gridapps/software/GCCcore/14.3.0/bin/c++ - skipped\n-- Detecting CXX compile features\n-- Detecting CXX compile features - done\n-- Using Legion_DIR from environment: /Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/share/Legion/cmake\n-- Found ZLIB: /gridapps/software/zlib/1.3.1-GCCcore-14.3.0/lib/libz.so (found version \"1.3.1\")\n-- Using BOOST_ROOT from environment: /Users/robsonlab/Teetly/hpx/boost_1_64_0/install\n-- Configuring incomplete, errors occurred!\n",
+    "build_stderr": "CMake Error at CMakeLists.txt:21 (find_package):\n  By not providing \"FindBoost.cmake\" in CMAKE_MODULE_PATH this project has\n  asked CMake to find a package configuration file provided by \"Boost\", but\n  CMake did not find one.\n\n  Could not find a package configuration file provided by \"Boost\" with any of\n  the following names:\n\n    BoostConfig.cmake\n    boost-config.cmake\n\n  Add the installation prefix of \"Boost\" to CMAKE_PREFIX_PATH or set\n  \"Boost_DIR\" to a directory containing one of the above files.  If \"Boost\"\n  provides a separate development package or SDK, be sure it has been\n  installed.\n\n\n"
+  },
+  "run_dictionary": null,
+  "output_files_content": {}
+}

@@ -1,0 +1,22 @@
+{
+  "iteration": 2,
+  "input_tokens": 18031,
+  "output_tokens": 27540,
+  "request_count": 2,
+  "generation_time_s": 348.009,
+  "build_status": false,
+  "run_status": false,
+  "overall_status": "BUILD_FAIL",
+  "per_file_status": {
+    "binary_tree.txt": "BUILD_FAIL",
+    "concurrency_tests.txt": "BUILD_FAIL",
+    "unit_tests.txt": "BUILD_FAIL"
+  },
+  "build_dictionary": {
+    "build_returncode": 2,
+    "build_stdout": "mkdir -p build/\ng++ -std=c++17 -I. -g -DASTM_LEGION LegionRuntime not found. -I/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/include  binary_tree.cpp -o build/binary_tree LegionRuntime not found. -L/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/lib -Wl,-rpath,/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/lib\n",
+    "build_stderr": "/usr/bin/ld: cannot find LegionRuntime: No such file or directory\n/usr/bin/ld: cannot find not: No such file or directory\n/usr/bin/ld: cannot find found.: No such file or directory\n/usr/bin/ld: cannot find LegionRuntime: No such file or directory\n/usr/bin/ld: cannot find not: No such file or directory\n/usr/bin/ld: cannot find found.: No such file or directory\ncollect2: error: ld returned 1 exit status\nmake: *** [Makefile:90: build/binary_tree] Error 1\n"
+  },
+  "run_dictionary": null,
+  "output_files_content": {}
+}

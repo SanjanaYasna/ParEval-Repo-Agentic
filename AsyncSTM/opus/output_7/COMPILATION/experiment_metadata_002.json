@@ -1,0 +1,48 @@
+{
+  "iteration": 2,
+  "input_tokens": 35144,
+  "output_tokens": 32921,
+  "request_count": 2,
+  "generation_time_s": 741.103,
+  "build_status": true,
+  "run_status": true,
+  "overall_status": "VALIDATION_FAIL",
+  "per_file_status": {
+    "binary_tree.txt": "PASS",
+    "concurrency_tests.txt": "PASS",
+    "unit_tests.txt": "VALIDATION_FAIL"
+  },
+  "build_dictionary": {
+    "build_returncode": 0,
+    "build_stdout": "mkdir -p build/\ng++ -std=c++17 -I. -g -I/Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/include -I/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/include  binary_tree.cpp -o build/binary_tree -L/Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/lib -llegion -lrealm -Wl,-rpath,/Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/lib -L/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/lib -Wl,-rpath,/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/lib -lpthread -ldl -lz\ng++ -std=c++17 -I. -g -I/Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/include -I/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/include  concurrency_tests.cpp -o build/concurrency_tests -L/Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/lib -llegion -lrealm -Wl,-rpath,/Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/lib -L/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/lib -Wl,-rpath,/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/lib -lpthread -ldl -lz\ng++ -std=c++17 -I. -g -I/Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/include -I/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/include  unit_tests.cpp -o build/unit_tests -L/Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/lib -llegion -lrealm -Wl,-rpath,/Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/lib -L/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/lib -Wl,-rpath,/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/lib -lpthread -ldl -lz\n",
+    "build_stderr": ""
+  },
+  "run_dictionary": {
+    "run_returncodes": [
+      0,
+      0,
+      0
+    ],
+    "run_stdouts": [
+      "[0 - 155555284c00]    0.186436 {4}{runtime}: LEGION WARNING: Region requirement 0 of operation Mapping (UID 3) in parent task top_level (UID 2) is using uninitialized data for field(s) 0,1,2,3 of logical region (1,1,1) (from file /Users/robsonlab/Teetly/legion-legion-25.06.0/runtime/legion/legion_ops.cc:1911)\n",
+      "",
+      ""
+    ],
+    "run_stderrs": [
+      "",
+      "",
+      ""
+    ],
+    "runtime": 1.45,
+    "per_command_runtimes": [
+      0.485,
+      0.493,
+      0.472
+    ]
+  },
+  "output_files_content": {
+    "binary_tree.txt": "Inserting Data:\n  Insert(Key: 50, Value: \"Root Node\")\n  Insert(Key: 30, Value: \"Left Child\")\n  Insert(Key: 70, Value: \"Right Child\")\n  Insert(Key: 20, Value: \"Left-Left Grandchild\")\n  Insert(Key: 40, Value: \"Left-Right Grandchild\")\n  Insert(Key: 60, Value: \"Right-Left Grandchild\")\n  Insert(Key: 80, Value: \"Right-Right Grandchild\")\n\nRunning Search Tests:\n  Search(Key: 99) -> Not Found.\n  Search(Key: 10) -> Not Found.\n  Search(Key: 50) -> Found! Result Value: \"Root Node\"\n  Search(Key: 20) -> Found! Result Value: \"Left-Left Grandchild\"\n  Search(Key: 60) -> Found! Result Value: \"Right-Left Grandchild\"\n  Search(Key: 80) -> Found! Result Value: \"Right-Right Grandchild\"\n  Search(Key: 45) -> Not Found.\n",
+    "concurrency_tests.txt": "Concurrency Increment Test\n  Initial Value: 0\n  Threads: 64\n  Operation: A = A + 1\n  Expected Result: 64\n  Actual Result:   64\n  Status: PASS\n\nExponential Growth (Squaring) Test\n  Initial Value: 2\n  Threads: 4\n  Operation: A = A * A\n  Expected Result: 65536\n  Actual Result:   65536\n  Status: PASS\n",
+    "unit_tests.txt": "Test (Read A, Write A): A = 2\nTest (Write A, Read A): A = 2\nTest (Write A, Write A): A = 1\nTest (Overwrite): A = 2\nTest (Read -> Write -> Read): A = 2\nTest (Write -> Read -> Write): A = 2\nTest (Arithmetic): A = 15, B = 1\nTest (Read A to Future): A = 15, B = 1\nTest (Retry Logic): A = 9, Attempts = 2\n"
+  }
+}

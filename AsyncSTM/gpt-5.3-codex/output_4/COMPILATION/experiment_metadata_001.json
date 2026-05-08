@@ -1,0 +1,22 @@
+{
+  "iteration": 1,
+  "input_tokens": 9628,
+  "output_tokens": 12016,
+  "request_count": 1,
+  "generation_time_s": 161.685,
+  "build_status": false,
+  "run_status": false,
+  "overall_status": "BUILD_FAIL",
+  "per_file_status": {
+    "binary_tree.txt": "BUILD_FAIL",
+    "concurrency_tests.txt": "BUILD_FAIL",
+    "unit_tests.txt": "BUILD_FAIL"
+  },
+  "build_dictionary": {
+    "build_returncode": 2,
+    "build_stdout": "",
+    "build_stderr": "Makefile:50: *** Failed to query Legion compile flags via CMake. Check Legion_DIR=/Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/share/Legion/cmake.  Stop.\n"
+  },
+  "run_dictionary": null,
+  "output_files_content": {}
+}

@@ -1,0 +1,620 @@
+[CMakeLists.txt]
+```cmake
+cmake_minimum_required(VERSION 3.14 FATAL_ERROR)
+project(osc_1d_legion LANGUAGES CXX)
+
+# Use Legion_DIR from environment if provided
+if(DEFINED ENV{Legion_DIR} AND NOT Legion_DIR)
+  set(Legion_DIR "$ENV{Legion_DIR}")
+endif()
+
+# Use BOOST_ROOT from environment if provided
+if(DEFINED ENV{BOOST_ROOT} AND NOT BOOST_ROOT)
+  set(BOOST_ROOT "$ENV{BOOST_ROOT}")
+endif()
+
+find_package(Legion REQUIRED CONFIG)
+find_package(Boost REQUIRED COMPONENTS program_options serialization thread)
+
+add_executable(odeint
+  odeint.cpp
+  algebra.hpp
+  shared_resize.hpp
+  shared_operations.hpp
+  system.hpp
+)
+
+target_compile_features(odeint PRIVATE cxx_std_17)
+target_compile_options(odeint PRIVATE -O3 -w)
+
+# Link Legion (handle common exported target names)
+if(TARGET Legion::Legion)
+  target_link_libraries(odeint PRIVATE Legion::Legion)
+elseif(TARGET legion)
+  target_link_libraries(odeint PRIVATE legion)
+elseif(DEFINED Legion_LIBRARIES)
+  target_link_libraries(odeint PRIVATE ${Legion_LIBRARIES})
+  if(DEFINED Legion_INCLUDE_DIRS)
+    target_include_directories(odeint PRIVATE ${Legion_INCLUDE_DIRS})
+  endif()
+else()
+  message(FATAL_ERROR "Legion library target not found.")
+endif()
+
+# Link Boost
+if(TARGET Boost::program_options)
+  target_link_libraries(odeint PRIVATE Boost::program_options Boost::serialization Boost::thread)
+else()
+  target_include_directories(odeint PRIVATE ${Boost_INCLUDE_DIRS})
+  target_link_libraries(odeint PRIVATE ${Boost_LIBRARIES})
+endif()
+```
+
+[ReadMe.md]
+```markdown
+# Legion Oscillator Chain (ODEINT)
+
+The program integrates a 1D nonlinear oscillator chain with:
+
+- On-site potential exponent: `KAPPA = 3.5`
+- Coupling exponent: `LAMBDA = 4.5`
+
+Time integration is performed using boost::numeric::odeint::symplectic_rkn_sb3a_mclachlan which is a stepper suitable for Hamiltonian systems. (https://www.boost.org/doc/libs/1_88_0/boost/numeric/odeint/stepper/symplectic_rkn_sb3a_mclachlan.hpp)
+All energy calculation outputs are written to ```odeint.txt```. The compiled program executable should be called ```odeint```.
+
+### Prerequisites
+
+- Legion installed
+- A C++17-compliant C++ compiler (e.g. GCC, Clang) and beyond
+- Boost, which path is set as `BOOST_ROOT` and incorporated into `LD_LIBRARY_PATH`
+
+### Build
+
+Repository depends on Legion 25.06.0
+
+Make sure to set $LEGION_ROOT to Legion install directory 
+
+```
+mkdir build; cd build
+
+cmake ..
+
+make
+```
+
+### Run
+-----------------
+The program is controlled by four command-line parameters:
+
+--N (int)
+Total dimension of the oscillator chain. Default 1024
+
+--G (int)
+Block size (number of elements per task, officially termed as 'dataflow' as this was a translation from HPX). Defult 128
+
+--steps (int)
+Number of time integration steps. Default 100
+
+--dt (double) 
+Time step size, default 0.01
+
+The energy computations should return a rounded integer results of the computation. 
+
+Example Run:
+```bash
+> ./odeint --N 2048 --dt 0.1
+> cat odeint.txt
+Dimension: 2048, number of elements per dataflow: 128, number of dataflow: 16, steps: 100, dt: 0.1
+Initialization complete, energy: 341
+Integration complete, energy: 341
+```
+```
+
+[algebra.hpp]
+```cpp
+// Copyright 2013 Mario Mulansky
+#ifndef SHARED_ALGEBRA_HPP
+#define SHARED_ALGEBRA_HPP
+
+#include <cstddef>
+#include <boost/range/size.hpp>
+
+// Legion port note:
+// Block-level parallelism should be expressed by Legion task/index-task launches
+// in the caller. This algebra remains a local element-wise transform usable inside
+// a Legion task.
+struct local_dataflow_algebra
+{
+    template <typename S, typename Op>
+    inline void for_each3(S &s1, const S &s2, const S &s3, Op op) const
+    {
+        const std::size_t N = boost::size(s1);
+        for (std::size_t i = 0; i < N; ++i)
+        {
+            op(s1[i], s2[i], s3[i]);
+        }
+    }
+};
+
+#endif
+```
+
+[odeint.cpp]
+```cpp
+// Copyright 2013 Mario Mulansky
+// Legion translation of odeint.cpp
+
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <memory>
+#include <random>
+#include <functional>
+#include <cmath>
+#include <algorithm>
+#include <cstddef>
+#include <utility>
+
+#include "legion.h"
+
+#include <boost/serialization/array.hpp>
+#include <boost/program_options.hpp>
+#include <boost/numeric/odeint/stepper/symplectic_rkn_sb3a_mclachlan.hpp>
+#include <boost/ref.hpp>
+
+#include "shared_resize.hpp"
+#include "algebra.hpp"
+#include "shared_operations.hpp"
+#include "system.hpp"
+
+using namespace Legion;
+using boost::numeric::odeint::symplectic_rkn_sb3a_mclachlan;
+
+typedef symplectic_rkn_sb3a_mclachlan<
+    state_type,
+    state_type,
+    double,
+    state_type,
+    state_type,
+    double,
+    local_dataflow_algebra,
+    local_dataflow_shared_operations
+> stepper_type;
+
+enum TaskIDs {
+    TOP_LEVEL_TASK_ID = 1,
+    INIT_Q_BLOCK_TASK_ID,
+    INIT_P_BLOCK_TASK_ID
+};
+
+// Shared process-local state used by init tasks.
+// (Valid for default mapper + local CPU execution model.)
+static state_type* g_q_blocks = nullptr;
+static state_type* g_p_blocks = nullptr;
+static dvec* g_p_init = nullptr;
+static std::size_t g_block_size = 0;
+
+static void init_q_block_task(
+    const Task* task,
+    const std::vector<PhysicalRegion>&,
+    Context,
+    Runtime*)
+{
+    const std::size_t i = static_cast<std::size_t>(task->index_point[0]);
+    shared_vec& block = (*g_q_blocks)[i];
+    if (!block) block = std::make_shared<dvec>();
+    block->assign(g_block_size, 0.0);
+}
+
+static void init_p_block_task(
+    const Task* task,
+    const std::vector<PhysicalRegion>&,
+    Context,
+    Runtime*)
+{
+    const std::size_t i = static_cast<std::size_t>(task->index_point[0]);
+    shared_vec& block = (*g_p_blocks)[i];
+    if (!block) block = std::make_shared<dvec>();
+    block->resize(g_block_size);
+
+    const std::size_t offset = i * g_block_size;
+    std::copy_n(g_p_init->begin() + offset, g_block_size, block->begin());
+}
+
+static bool parse_cli(
+    const InputArgs& args,
+    boost::program_options::variables_map& vm)
+{
+    namespace po = boost::program_options;
+
+    po::options_description desc_commandline("Usage: odeint [options]");
+    desc_commandline.add_options()
+        ("N", po::value<std::size_t>()->default_value(1024), "Dimension (1024)")
+        ("G", po::value<std::size_t>()->default_value(128), "Block size (128)")
+        ("steps", po::value<std::size_t>()->default_value(100), "time steps (100)")
+        ("dt", po::value<double>()->default_value(0.01), "step size (0.01)");
+
+    // Allow Legion runtime options (-ll:cpu, etc.) to coexist.
+    auto parsed = po::command_line_parser(args.argc, args.argv)
+                      .options(desc_commandline)
+                      .allow_unregistered()
+                      .run();
+
+    po::store(parsed, vm);
+    po::notify(vm);
+    return true;
+}
+
+static void top_level_task(
+    const Task*,
+    const std::vector<PhysicalRegion>&,
+    Context ctx,
+    Runtime* runtime)
+{
+    boost::program_options::variables_map vm;
+    if (!parse_cli(Runtime::get_input_args(), vm)) {
+        std::cerr << "Failed to parse command line options.\n";
+        return;
+    }
+
+    const std::size_t N = vm["N"].as<std::size_t>();
+    const std::size_t G = vm["G"].as<std::size_t>();
+    const std::size_t steps = vm["steps"].as<std::size_t>();
+    const double dt = vm["dt"].as<double>();
+
+    if (G == 0 || (N % G) != 0) {
+        std::cerr << "Invalid arguments: G must be > 0 and N must be divisible by G.\n";
+        return;
+    }
+
+    const std::size_t M = N / G;
+
+    std::ofstream outfile("odeint.txt");
+    if (!outfile.is_open()) {
+        std::cerr << "Failed to open odeint.txt for writing.\n";
+        return;
+    }
+
+    outfile << "Dimension: " << N
+            << ", number of elements per dataflow: " << G
+            << ", number of dataflow: " << M
+            << ", steps: " << steps
+            << ", dt: " << dt << std::endl;
+
+    dvec p_init(N);
+    std::uniform_real_distribution<double> distribution(-1.0, 1.0);
+    std::mt19937 engine(0);
+    auto generator = [&]() { return distribution(engine); };
+    std::generate(p_init.begin(), p_init.end(), generator);
+
+    state_type q_in(M), p_in(M);
+
+    g_q_blocks = &q_in;
+    g_p_blocks = &p_in;
+    g_p_init = &p_init;
+    g_block_size = G;
+
+    if (M > 0) {
+        Rect<1> launch_rect(0, static_cast<coord_t>(M - 1));
+        Domain launch_domain(launch_rect);
+        ArgumentMap arg_map;
+
+        IndexLauncher q_launcher(
+            INIT_Q_BLOCK_TASK_ID, launch_domain, TaskArgument(nullptr, 0), arg_map);
+        FutureMap q_fm = runtime->execute_index_space(ctx, q_launcher);
+        q_fm.wait_all_results();
+
+        IndexLauncher p_launcher(
+            INIT_P_BLOCK_TASK_ID, launch_domain, TaskArgument(nullptr, 0), arg_map);
+        FutureMap p_fm = runtime->execute_index_space(ctx, p_launcher);
+        p_fm.wait_all_results();
+    }
+
+    g_q_blocks = nullptr;
+    g_p_blocks = nullptr;
+    g_p_init = nullptr;
+    g_block_size = 0;
+
+    outfile << "Initialization complete, energy: "
+            << static_cast<long long>(std::round(energy(q_in, p_in))) << std::endl;
+
+    stepper_type stepper;
+    auto qp = std::make_pair(boost::ref(q_in), boost::ref(p_in));
+    double t = 0.0;
+    for (std::size_t step = 0; step < steps; ++step) {
+        stepper.do_step(osc_chain, qp, t, dt);
+        t += dt;
+    }
+
+    outfile << "Integration complete, energy: "
+            << static_cast<long long>(std::round(energy(q_in, p_in))) << std::endl;
+}
+
+int main(int argc, char* argv[])
+{
+    Runtime::set_top_level_task_id(TOP_LEVEL_TASK_ID);
+
+    {
+        TaskVariantRegistrar registrar(TOP_LEVEL_TASK_ID, "top_level");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        Runtime::preregister_task_variant<top_level_task>(registrar, "top_level");
+    }
+    {
+        TaskVariantRegistrar registrar(INIT_Q_BLOCK_TASK_ID, "init_q_block");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        registrar.set_leaf();
+        Runtime::preregister_task_variant<init_q_block_task>(registrar, "init_q_block");
+    }
+    {
+        TaskVariantRegistrar registrar(INIT_P_BLOCK_TASK_ID, "init_p_block");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        registrar.set_leaf();
+        Runtime::preregister_task_variant<init_p_block_task>(registrar, "init_p_block");
+    }
+
+    // Example Legion parallel run:
+    //   ./odeint --N 2048 --dt 0.1 -ll:cpu 8
+    return Runtime::start(argc, argv);
+}
+```
+
+[shared_operations.hpp]
+```cpp
+// Copyright 2013 Mario Mulansky
+// Legion port: local algebraic operations used by odeint steppers.
+#ifndef SHARED_OPERATIONS_HPP
+#define SHARED_OPERATIONS_HPP
+
+#include <cstddef>
+
+#include "shared_resize.hpp"
+
+struct local_legion_shared_operations
+{
+    template <typename Fac1, typename Fac2 = Fac1>
+    struct scale_sum2
+    {
+        Fac1 m_alpha1;
+        Fac2 m_alpha2;
+
+        scale_sum2() : m_alpha1(0), m_alpha2(0) {}
+
+        scale_sum2(Fac1 alpha1, Fac2 alpha2)
+            : m_alpha1(alpha1), m_alpha2(alpha2)
+        {}
+
+        template <typename S1, typename S2, typename S3>
+        void operator()(S1& x1, const S2& x2, const S3& x3) const
+        {
+            const std::size_t n = x1->size();
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                (*x1)[i] = m_alpha1 * (*x2)[i] + m_alpha2 * (*x3)[i];
+            }
+        }
+    };
+};
+
+// Backward-compatible name to simplify incremental migration of other files.
+using local_dataflow_shared_operations = local_legion_shared_operations;
+
+#endif
+```
+
+[shared_resize.hpp]
+```cpp
+// Copyright 2013 Mario Mulansky
+// resizing functionality for odeint (Legion translation)
+#ifndef SHARED_RESIZE_HPP
+#define SHARED_RESIZE_HPP
+
+#include <cstddef>
+#include <memory>
+#include <vector>
+
+#include <boost/numeric/odeint/util/is_resizeable.hpp>
+#include <boost/numeric/odeint/util/resize.hpp>
+#include <boost/numeric/odeint/util/same_size.hpp>
+#include <boost/numeric/odeint/util/state_wrapper.hpp>
+
+// Legion version uses plain host-side block storage; Legion task launches
+// and synchronization are handled outside this header.
+typedef std::vector<double> dvec;
+typedef std::shared_ptr<dvec> shared_vec;
+typedef std::vector<shared_vec> state_type;
+
+namespace boost {
+namespace numeric {
+namespace odeint {
+
+template<>
+struct is_resizeable<state_type>
+{
+    typedef boost::true_type type;
+    static constexpr bool value = type::value;
+};
+
+template<>
+struct same_size_impl<state_type, state_type>
+{
+    static bool same_size(const state_type& x1, const state_type& x2)
+    {
+        return x1.size() == x2.size();
+    }
+};
+
+template<>
+struct resize_impl<state_type, state_type>
+{
+    static void resize(state_type& x1, const state_type& x2)
+    {
+        x1.resize(x2.size());
+        for (std::size_t i = 0; i < x2.size(); ++i)
+        {
+            const std::size_t n = (x2[i] ? x2[i]->size() : 0);
+            x1[i] = std::make_shared<dvec>(n);
+        }
+    }
+};
+
+} // namespace odeint
+} // namespace numeric
+} // namespace boost
+
+#endif
+```
+
+[system.hpp]
+```cpp
+// Copyright 2013 Mario Mulansky
+// Translated from HPX dataflow model to Legion task/future model
+
+#ifndef SYSTEM_HPP
+#define SYSTEM_HPP
+
+#include <cassert>
+#include <cmath>
+#include <cstddef>
+#include <vector>
+
+#include <boost/math/special_functions/sign.hpp>
+
+#include "shared_resize.hpp"
+
+const double KAPPA = 3.5;
+const double LAMBDA = 4.5;
+
+namespace checked_math {
+inline double pow(double x, double y) {
+    if (x == 0.0) return 0.0;
+    using std::abs;
+    using std::pow;
+    return pow(abs(x), y);
+}
+}  // namespace checked_math
+
+inline double signed_pow(double x, double k) {
+    using boost::math::sign;
+    return checked_math::pow(x, k) * sign(x);
+}
+
+inline void system_first_block(const dvec& q, const double q_r, dvec& dpdt) {
+    const std::size_t N = q.size();
+    dpdt.resize(N);
+    if (N == 0) return;
+
+    double coupling_lr = -signed_pow(q[0], LAMBDA - 1.0);
+    for (std::size_t i = 0; i + 1 < N; ++i) {
+        dpdt[i] = -signed_pow(q[i], KAPPA - 1.0) + coupling_lr;
+        coupling_lr = signed_pow(q[i] - q[i + 1], LAMBDA - 1.0);
+        dpdt[i] -= coupling_lr;
+    }
+
+    dpdt[N - 1] = -signed_pow(q[N - 1], KAPPA - 1.0)
+                + coupling_lr
+                - signed_pow(q[N - 1] - q_r, LAMBDA - 1.0);
+}
+
+inline void system_center_block(const dvec& q, const double q_l, const double q_r, dvec& dpdt) {
+    const std::size_t N = q.size();
+    dpdt.resize(N);
+    if (N == 0) return;
+
+    double coupling_lr = -signed_pow(q[0] - q_l, LAMBDA - 1.0);
+    for (std::size_t i = 0; i + 1 < N; ++i) {
+        dpdt[i] = -signed_pow(q[i], KAPPA - 1.0) + coupling_lr;
+        coupling_lr = signed_pow(q[i] - q[i + 1], LAMBDA - 1.0);
+        dpdt[i] -= coupling_lr;
+    }
+
+    dpdt[N - 1] = -signed_pow(q[N - 1], KAPPA - 1.0)
+                + coupling_lr
+                - signed_pow(q[N - 1] - q_r, LAMBDA - 1.0);
+}
+
+inline void system_last_block(const dvec& q, const double q_l, dvec& dpdt) {
+    const std::size_t N = q.size();
+    dpdt.resize(N);
+    if (N == 0) return;
+
+    double coupling_lr = -signed_pow(q[0] - q_l, LAMBDA - 1.0);
+    for (std::size_t i = 0; i + 1 < N; ++i) {
+        dpdt[i] = -signed_pow(q[i], KAPPA - 1.0) + coupling_lr;
+        coupling_lr = signed_pow(q[i] - q[i + 1], LAMBDA - 1.0);
+        dpdt[i] -= coupling_lr;
+    }
+
+    dpdt[N - 1] = -signed_pow(q[N - 1], KAPPA - 1.0)
+                + coupling_lr
+                - signed_pow(q[N - 1], LAMBDA - 1.0);
+}
+
+inline void osc_chain(const state_type& q, state_type& dpdt) {
+    const std::size_t blocks = q.size();
+    if (dpdt.size() != blocks) dpdt.resize(blocks);
+    if (blocks == 0) return;
+
+    for (std::size_t i = 0; i < blocks; ++i) {
+        assert(q[i] && "q block must be initialized.");
+        if (!dpdt[i]) dpdt[i] = std::make_shared<dvec>(q[i]->size());
+    }
+
+    if (blocks == 1) {
+        system_first_block(*q[0], 0.0, *dpdt[0]);
+        return;
+    }
+
+    system_first_block(*q[0], q[1]->front(), *dpdt[0]);
+
+    for (std::size_t i = 1; i + 1 < blocks; ++i) {
+        system_center_block(*q[i], q[i - 1]->back(), q[i + 1]->front(), *dpdt[i]);
+    }
+
+    system_last_block(*q[blocks - 1], q[blocks - 2]->back(), *dpdt[blocks - 1]);
+}
+
+inline void osc_chain_gb(const state_type& q, state_type& dpdt) {
+    osc_chain(q, dpdt);
+}
+
+inline double energy(const dvec& q, const dvec& p) {
+    if (q.empty()) return 0.0;
+
+    using checked_math::pow;
+    using std::abs;
+
+    const std::size_t N = q.size();
+    double e = 0.5 * pow(abs(q[0]), LAMBDA) / LAMBDA;
+    for (std::size_t i = 0; i + 1 < N; ++i) {
+        e += 0.5 * p[i] * p[i] + pow(q[i], KAPPA) / KAPPA
+           + pow(abs(q[i] - q[i + 1]), LAMBDA) / LAMBDA;
+    }
+    e += 0.5 * p[N - 1] * p[N - 1] + pow(q[N - 1], KAPPA) / KAPPA
+       + 0.5 * pow(abs(q[N - 1]), LAMBDA) / LAMBDA;
+    return e;
+}
+
+inline double energy(const state_type& q_blocks, const state_type& p_blocks) {
+    assert(q_blocks.size() == p_blocks.size());
+
+    std::size_t total = 0;
+    for (std::size_t i = 0; i < q_blocks.size(); ++i) {
+        if (q_blocks[i]) total += q_blocks[i]->size();
+    }
+
+    dvec q;
+    dvec p;
+    q.reserve(total);
+    p.reserve(total);
+
+    for (std::size_t i = 0; i < q_blocks.size(); ++i) {
+        assert(q_blocks[i] && p_blocks[i] && "state blocks must be initialized.");
+        q.insert(q.end(), q_blocks[i]->begin(), q_blocks[i]->end());
+        p.insert(p.end(), p_blocks[i]->begin(), p_blocks[i]->end());
+    }
+
+    return energy(q, p);
+}
+
+#endif
+```

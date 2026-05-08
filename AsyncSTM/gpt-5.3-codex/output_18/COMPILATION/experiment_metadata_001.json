@@ -1,0 +1,22 @@
+{
+  "iteration": 1,
+  "input_tokens": 8923,
+  "output_tokens": 12596,
+  "request_count": 1,
+  "generation_time_s": 158.288,
+  "build_status": false,
+  "run_status": false,
+  "overall_status": "BUILD_FAIL",
+  "per_file_status": {
+    "binary_tree.txt": "BUILD_FAIL",
+    "concurrency_tests.txt": "BUILD_FAIL",
+    "unit_tests.txt": "BUILD_FAIL"
+  },
+  "build_dictionary": {
+    "build_returncode": 2,
+    "build_stdout": "ERROR: Failed to resolve Legion flags.\n       Set LEGION_DIR (or Legion_DIR/LEGION_ROOT) to Legion's CMake package directory.\n       Or ensure pkg-config can resolve 'legion'.\n",
+    "build_stderr": "make: *** [Makefile:42: check-legion] Error 1\n"
+  },
+  "run_dictionary": null,
+  "output_files_content": {}
+}

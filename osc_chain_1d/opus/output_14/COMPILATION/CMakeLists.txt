@@ -1,0 +1,51 @@
+cmake_minimum_required(VERSION 3.5...3.30 FATAL_ERROR)
+
+# CMP0167 (CMake 3.30+): prefer FindBoost module for older Boost installs
+if(POLICY CMP0167)
+    cmake_policy(SET CMP0167 OLD)
+endif()
+
+project(osc_1d CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Find Legion
+if(DEFINED ENV{Legion_DIR})
+    set(Legion_DIR "$ENV{Legion_DIR}")
+    message(STATUS "Using Legion_DIR from environment: $ENV{Legion_DIR}")
+endif()
+
+find_package(Legion REQUIRED)
+
+# Find Boost (header-only usage)
+if(DEFINED ENV{BOOST_ROOT})
+    set(BOOST_ROOT "$ENV{BOOST_ROOT}")
+    message(STATUS "Using BOOST_ROOT from environment: $ENV{BOOST_ROOT}")
+endif()
+
+find_package(Boost QUIET)
+if(NOT Boost_FOUND)
+    if(DEFINED BOOST_ROOT)
+        set(Boost_INCLUDE_DIRS "${BOOST_ROOT}/include")
+        message(STATUS "Boost not found by CMake, using BOOST_ROOT directly: ${BOOST_ROOT}")
+    elseif(DEFINED ENV{BOOST_ROOT})
+        set(Boost_INCLUDE_DIRS "$ENV{BOOST_ROOT}/include")
+        message(STATUS "Boost not found by CMake, using BOOST_ROOT env directly: $ENV{BOOST_ROOT}")
+    else()
+        message(FATAL_ERROR "Boost not found. Please set BOOST_ROOT environment variable.")
+    endif()
+endif()
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w -O3")
+
+add_executable(odeint odeint.cpp)
+
+target_include_directories(odeint PRIVATE
+    ${Boost_INCLUDE_DIRS}
+)
+
+target_link_libraries(odeint
+    Legion::Legion
+    ${Boost_LIBRARIES}
+)

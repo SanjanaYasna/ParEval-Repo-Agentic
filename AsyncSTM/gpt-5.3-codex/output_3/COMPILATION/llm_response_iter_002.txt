@@ -1,0 +1,1366 @@
+[Makefile]
+```make
+CXX ?= g++
+
+# Accept either Legion_DIR or LEGION_DIR from environment.
+ifndef Legion_DIR
+ifneq ($(LEGION_DIR),)
+Legion_DIR := $(LEGION_DIR)
+endif
+endif
+
+ifndef Legion_DIR
+$(error Legion_DIR is not set. Please export Legion_DIR to the directory containing LegionConfig.cmake)
+endif
+
+# Query Legion compile/link flags from its CMake package config.
+# Try GNU first, then Clang, and finally fall back to a prefix guess.
+define legion_find
+$(strip $(shell cmake --find-package -DNAME=Legion -DCOMPILER_ID=$(1) -DLANGUAGE=CXX -DMODE=$(2) -DLegion_DIR=$(Legion_DIR) -DCMAKE_PREFIX_PATH=$(Legion_DIR) 2>/dev/null))
+endef
+
+LEGION_CFLAGS := $(call legion_find,GNU,COMPILE)
+LEGION_LIBS   := $(call legion_find,GNU,LINK)
+
+ifeq ($(LEGION_CFLAGS),)
+LEGION_CFLAGS := $(call legion_find,Clang,COMPILE)
+endif
+ifeq ($(LEGION_LIBS),)
+LEGION_LIBS := $(call legion_find,Clang,LINK)
+endif
+
+LEGION_PREFIX := $(Legion_DIR)
+ifneq ($(wildcard $(Legion_DIR)/include/legion.h),)
+LEGION_PREFIX := $(Legion_DIR)
+else ifneq ($(wildcard $(Legion_DIR)/../../include/legion.h),)
+LEGION_PREFIX := $(abspath $(Legion_DIR)/../..)
+else ifneq ($(wildcard $(Legion_DIR)/../../../include/legion.h),)
+LEGION_PREFIX := $(abspath $(Legion_DIR)/../../..)
+endif
+
+ifeq ($(LEGION_CFLAGS),)
+LEGION_CFLAGS := -I$(LEGION_PREFIX)/include
+endif
+ifeq ($(LEGION_LIBS),)
+LEGION_LIBS := -L$(LEGION_PREFIX)/lib -Wl,-rpath,$(LEGION_PREFIX)/lib -llegion -lrealm
+endif
+
+# Boost paths (optional)
+BOOST_INCLUDE :=
+BOOST_LIB :=
+ifneq ($(BOOST_ROOT),)
+BOOST_INCLUDE := -I$(BOOST_ROOT)/include
+BOOST_LIB     := -L$(BOOST_ROOT)/lib -Wl,-rpath,$(BOOST_ROOT)/lib
+endif
+
+CXXFLAGS += -std=c++17 -I. -g -DASTM_LEGION $(LEGION_CFLAGS) $(BOOST_INCLUDE)
+LDFLAGS  += $(LEGION_LIBS) $(BOOST_LIB) -lz -pthread
+
+ADDITIONAL_SOURCES :=
+PROGRAMS := build/binary_tree build/unit_tests build/concurrency_tests
+
+all: build $(PROGRAMS)
+
+.PHONY: all clean
+
+build:
+	mkdir -p build
+
+build/%: %.cpp | build
+	$(CXX) $(CXXFLAGS) $(ADDITIONAL_SOURCES) $< -o $@ $(LDFLAGS)
+
+clean:
+	rm -rf build
+```
+
+[ReadMe.md]
+```markdown
+# ASTM (Asynchronous Software Transaction Memory)
+
+A header-only Software Transactional Memory (STM) library built on Legion. ASTM provides optimistic concurrency control for shared variables and features such as:
+
+Transaction manager:
+    - Provides transaction-local storage
+    - Implement the four basic operations which occur in transactions: read, write, async, commit 
+
+## Programs
+binary_tree
+Example implementation of an unbalanced binary tree implemented using ASTM, with values that have side-effecting constructors. Each non-empty node has astm::new to allocate its value so there are no dependencies, and abstracts programmers away from performing explicit reads and writes through the use of smart pointer syntax. Results are written to binary_tree.txt.
+
+unit_tests
+Unit tests covering core STM operations: read/write ordering, overwrites, arithmetic with local variables, future-based reads, and transaction retry logic on conflict. Results are written to unit_tests.txt.
+
+concurrency_tests
+Concurrency stress tests verifying atomicity under contention, including threads incrementing a shared integer and squaring transactions. Results are written to concurrency_test.txt. 
+
+## Prerequisites 
+
+- Legion installed
+- A C++17-compliant C++ compiler (e.g. GCC, Clang) and beyond
+- Boost, which path is set as `BOOST_ROOT` and incorporated into `LD_LIBRARY_PATH`
+
+### Build
+-----------------
+Repository depends on Legion 25.06.0
+
+Make sure to set $LEGION_ROOT to Legion install directory 
+
+```
+make
+```
+
+If you would like to rebulid, run  ```make clean``` before running ```make``` again. 
+
+### Run
+The program produces three executables:
+    - ```binary_tree``` from binary_tree.cpp , outputs  binary_tree.txt
+    - ```unit_tests``` from unit_tests.cpp, outputs unit_tests.txt
+    - ```concurrency_tests``` from concurrency_tests.cpp, outputs concurrency_test.txt
+
+```
+
+[astm.hpp]
+```cpp
+////////////////////////////////////////////////////////////////////////////////
+//  Copyright (c) 2014 Bryce Adelstein-Lelbach
+//  Copyright (c) 2014 Steve Brandt
+//
+//  Distributed under the Boost Software License, Version 1.0. (See accompanying
+//  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+////////////////////////////////////////////////////////////////////////////////
+
+#if !defined(ASTM_DBA88345_57B8_4CC8_A574_D5F007250E94)
+#define ASTM_DBA88345_57B8_4CC8_A574_D5F007250E94
+
+#include "astm_config.hpp"
+
+#include <legion.h>
+
+#include <cassert>
+#include <atomic>
+#include <cstring>
+#include <future>
+#include <list>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+#include <functional>
+
+namespace astm
+{
+
+struct shared_var_base;
+struct transaction;
+struct transaction_future;
+
+namespace detail
+{
+    constexpr Legion::TaskID ASTM_INTERNAL_CONTINUATION_TASK_ID = 0x7FFF0101;
+
+    inline std::shared_future<void> make_ready_shared_future()
+    {
+        std::promise<void> p;
+        p.set_value();
+        return p.get_future().share();
+    }
+
+    struct continuation_registry
+    {
+        std::mutex mtx;
+        std::unordered_map<uint64_t, std::function<void()>> funcs;
+        std::atomic<uint64_t> next_id{1};
+    };
+
+    inline continuation_registry& registry()
+    {
+        static continuation_registry r;
+        return r;
+    }
+
+    inline void continuation_task(
+        const Legion::Task* task,
+        const std::vector<Legion::PhysicalRegion>&,
+        Legion::Context,
+        Legion::Runtime*)
+    {
+        uint64_t id = 0;
+        if (task != nullptr && task->args != nullptr && task->arglen == sizeof(uint64_t))
+            std::memcpy(&id, task->args, sizeof(uint64_t));
+
+        std::function<void()> fn;
+        {
+            std::lock_guard<std::mutex> lk(registry().mtx);
+            auto it = registry().funcs.find(id);
+            if (it != registry().funcs.end())
+            {
+                fn = std::move(it->second);
+                registry().funcs.erase(it);
+            }
+        }
+
+        if (fn) fn();
+    }
+
+    inline void preregister_internal_tasks()
+    {
+        static bool once = []() {
+            Legion::TaskVariantRegistrar registrar(
+                ASTM_INTERNAL_CONTINUATION_TASK_ID,
+                "astm_internal_continuation");
+            registrar.add_constraint(
+                Legion::ProcessorConstraint(Legion::Processor::LOC_PROC));
+            Legion::Runtime::preregister_task_variant<continuation_task>(
+                registrar, "astm_internal_continuation");
+            return true;
+        }();
+        (void)once;
+    }
+
+    inline Legion::Future launch_legion_continuation(
+        Legion::Runtime* runtime,
+        Legion::Context ctx,
+        std::function<void()> fn,
+        const Legion::Future* dep = nullptr)
+    {
+        preregister_internal_tasks();
+
+        uint64_t id = registry().next_id.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lk(registry().mtx);
+            registry().funcs.emplace(id, std::move(fn));
+        }
+
+        Legion::TaskLauncher launcher(
+            ASTM_INTERNAL_CONTINUATION_TASK_ID,
+            Legion::TaskArgument(&id, sizeof(uint64_t)));
+
+        if (dep != nullptr)
+            launcher.add_future(*dep);
+
+        return runtime->execute_task(ctx, launcher);
+    }
+} // namespace detail
+
+struct shared_var_base
+{
+    virtual ~shared_var_base() {}
+
+    virtual shared_var_base* clone() const = 0;
+    virtual void write(shared_var_base const&) = 0;
+    virtual std::unique_lock<std::mutex> lock() const = 0;
+    virtual bool operator==(shared_var_base const&) const = 0;
+};
+
+struct transaction_future
+{
+  private:
+    transaction* trans_;
+    std::shared_future<void> std_chain_;
+    std::vector<Legion::Future> legion_chain_;
+
+  public:
+    explicit transaction_future(transaction* trans)
+      : trans_(trans)
+      , std_chain_(detail::make_ready_shared_future())
+    {}
+
+    explicit transaction_future(transaction& trans)
+      : trans_(&trans)
+      , std_chain_(detail::make_ready_shared_future())
+    {}
+
+    template <typename F>
+    void then(F f);
+
+    void get();
+
+    friend struct transaction;
+};
+
+template <typename T>
+struct shared_var : shared_var_base
+{
+    struct local_var
+    {
+      private:
+        transaction* trans_;
+        shared_var_base* var_;
+
+      public:
+        local_var(transaction* trans, shared_var_base* var)
+          : trans_(trans)
+          , var_(var)
+        {}
+
+        T get() const;
+        operator T const&() const;
+
+        local_var& operator=(shared_var_base const& rhs);
+        local_var& operator=(T const& rhs);
+
+        template <typename F>
+        void then(F f);
+    };
+
+  private:
+    T data_;
+    mutable std::mutex mtx_;
+
+  public:
+    shared_var()
+      : data_()
+      , mtx_()
+    {}
+
+    explicit shared_var(T const& t)
+      : data_(t)
+      , mtx_()
+    {}
+
+    explicit shared_var(T&& t)
+      : data_(std::move(t))
+      , mtx_()
+    {}
+
+    shared_var(shared_var const& rhs)
+      : data_(rhs.data_)
+      , mtx_()
+    {}
+
+    ~shared_var() {}
+
+    shared_var_base* clone() const override
+    {
+        auto l = lock();
+        (void)l;
+        return new shared_var(data_);
+    }
+
+    T const& read() const
+    {
+        return data_;
+    }
+
+    void write(T const& rhs)
+    {
+        data_ = rhs;
+    }
+
+    void write(shared_var_base const& rhs) override
+    {
+        data_ = dynamic_cast<shared_var const*>(&rhs)->read();
+    }
+
+    std::unique_lock<std::mutex> lock() const override
+    {
+        return std::unique_lock<std::mutex>(mtx_);
+    }
+
+    bool operator==(shared_var_base const& rhs) const override
+    {
+        return data_ == dynamic_cast<shared_var const*>(&rhs)->read();
+    }
+
+    local_var get_local(transaction& trans)
+    {
+        return local_var(&trans, this);
+    }
+};
+
+struct transaction
+{
+    std::list<
+        std::pair<
+            shared_var_base*,
+            std::shared_ptr<shared_var_base>
+        >
+    > read_list;
+
+    std::set<shared_var_base*> write_set;
+
+    std::list<
+        std::pair<
+            transaction_future*,
+            std::function<void(transaction*)>
+        >
+    > async_list;
+
+    std::map<
+        shared_var_base*,
+        std::shared_ptr<shared_var_base>
+    > variables;
+
+    Legion::Runtime* runtime_;
+    Legion::Context ctx_;
+
+    transaction()
+      : read_list()
+      , write_set()
+      , async_list()
+      , variables()
+      , runtime_(nullptr)
+      , ctx_()
+    {}
+
+    transaction(Legion::Runtime* runtime, Legion::Context ctx)
+      : read_list()
+      , write_set()
+      , async_list()
+      , variables()
+      , runtime_(runtime)
+      , ctx_(ctx)
+    {
+        detail::preregister_internal_tasks();
+    }
+
+    void bind_legion_context(Legion::Runtime* runtime, Legion::Context ctx)
+    {
+        runtime_ = runtime;
+        ctx_ = ctx;
+        detail::preregister_internal_tasks();
+    }
+
+    bool has_legion_context() const
+    {
+        return runtime_ != nullptr;
+    }
+
+    void clear()
+    {
+        read_list.clear();
+        write_set.clear();
+        async_list.clear();
+        variables.clear();
+    }
+
+    bool commit_transaction()
+    {
+        std::list<std::unique_lock<std::mutex>> locks;
+
+        for (auto const& var : variables)
+        {
+            assert(var.first != nullptr);
+            locks.push_back(var.first->lock());
+        }
+
+        for (auto const& var : read_list)
+        {
+            assert(var.first != nullptr);
+            if (!((*var.first) == (*var.second)))
+            {
+                clear();
+                return false;
+            }
+        }
+
+        for (shared_var_base* var : write_set)
+        {
+            assert(var != nullptr);
+            auto it = variables.find(var);
+            assert(it != variables.end());
+            var->write(*it->second);
+        }
+
+        for (auto& op : async_list)
+        {
+            if (has_legion_context())
+            {
+                const Legion::Future* dep_ptr = nullptr;
+                Legion::Future dep;
+
+                if (op.first != nullptr && !op.first->legion_chain_.empty())
+                {
+                    dep = op.first->legion_chain_.back();
+                    dep_ptr = &dep;
+                }
+
+                Legion::Future launched = detail::launch_legion_continuation(
+                    runtime_, ctx_, std::bind(op.second, this), dep_ptr);
+
+                if (op.first != nullptr)
+                    op.first->legion_chain_.push_back(launched);
+            }
+            else
+            {
+                if (op.first == nullptr)
+                {
+                    std::thread([fn = op.second, this]() { fn(this); }).detach();
+                }
+                else
+                {
+                    auto prev = op.first->std_chain_;
+                    auto next = std::async(
+                        std::launch::async,
+                        [prev, fn = op.second, this]() mutable {
+                            prev.wait();
+                            fn(this);
+                        });
+                    op.first->std_chain_ = next.share();
+                }
+            }
+        }
+
+        return true;
+    }
+
+    shared_var_base const& read(shared_var_base* var)
+    {
+        assert(var != nullptr);
+
+        std::pair<shared_var_base*, std::shared_ptr<shared_var_base>> entry(var, nullptr);
+        auto result = variables.insert(entry);
+
+        if (result.second)
+        {
+            result.first->second.reset(var->clone());
+            read_list.push_back(*result.first);
+            return *result.first->second;
+        }
+
+        return *result.first->second;
+    }
+
+    void write(shared_var_base* var, shared_var_base const& value)
+    {
+        assert(var != nullptr);
+
+        std::pair<shared_var_base*, std::shared_ptr<shared_var_base>> entry(
+            var, std::shared_ptr<shared_var_base>(value.clone()));
+
+        auto result = variables.insert(entry);
+
+        if (result.second)
+        {
+            write_set.insert(var);
+        }
+        else
+        {
+            result.first->second = entry.second;
+            write_set.insert(var);
+        }
+    }
+
+    void then(transaction_future* fut, std::function<void(transaction*)> F)
+    {
+        async_list.emplace_back(fut, std::move(F));
+    }
+};
+
+template <typename T>
+shared_var<T>::local_var::operator T const&() const
+{
+    return dynamic_cast<shared_var const*>(&trans_->read(var_))->read();
+}
+
+template <typename T>
+T shared_var<T>::local_var::get() const
+{
+    return dynamic_cast<shared_var const*>(&trans_->read(var_))->read();
+}
+
+template <typename T>
+typename shared_var<T>::local_var&
+shared_var<T>::local_var::operator=(shared_var_base const& rhs)
+{
+    trans_->write(var_, rhs);
+    return *this;
+}
+
+template <typename T>
+typename shared_var<T>::local_var&
+shared_var<T>::local_var::operator=(T const& rhs)
+{
+    shared_var tmp(rhs);
+    trans_->write(var_, tmp);
+    return *this;
+}
+
+template <typename T>
+template <typename F>
+void shared_var<T>::local_var::then(F f)
+{
+    assert(trans_ != nullptr);
+    trans_->then(nullptr, std::function<void(transaction*)>(std::move(f)));
+}
+
+template <typename F>
+void transaction_future::then(F f)
+{
+    assert(trans_ != nullptr);
+    trans_->then(this, std::function<void(transaction*)>(std::move(f)));
+}
+
+inline void transaction_future::get()
+{
+    for (auto& f : legion_chain_)
+        f.get_void_result();
+
+    std_chain_.wait();
+}
+
+} // namespace astm
+
+#endif // ASTM_DBA88345_57B8_4CC8_A574_D5F007250E94
+```
+
+[astm_config.hpp]
+```cpp
+////////////////////////////////////////////////////////////////////////////////
+//  Copyright (c) 2014 Bryce Adelstein-Lelbach
+//  Copyright (c) 2014 Steve Brandt
+//
+//  Distributed under the Boost Software License, Version 1.0. (See accompanying
+//  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+////////////////////////////////////////////////////////////////////////////////
+
+#if !defined(ASTM_DBA88345_57B8_4CC8_A574_D5F007250E95)
+#define ASTM_DBA88345_57B8_4CC8_A574_D5F007250E95
+
+// Legion headers (backend target)
+#include <legion.h>
+
+// Host-side utilities used by ASTM internals
+#include <future>
+#include <mutex>
+#include <functional>
+#include <type_traits>
+#include <utility>
+#include <cassert>
+
+namespace astm
+{
+    // A small future wrapper with .get() and .then(...) to preserve ASTM usage.
+    // This is Legion-targeted configuration, but keeps the original ASTM API shape.
+    template <typename T>
+    class legion_future
+    {
+    public:
+        legion_future() = default;
+
+        explicit legion_future(std::future<T>&& f)
+          : fut_(f.share())
+        {}
+
+        explicit legion_future(std::shared_future<T> f)
+          : fut_(std::move(f))
+        {}
+
+        T get() const
+        {
+            return fut_.get();
+        }
+
+        template <typename F>
+        auto then(F&& f) const -> legion_future<std::invoke_result_t<F, T>>
+        {
+            using R = std::invoke_result_t<F, T>;
+            auto prev = fut_;
+
+            auto next = std::async(std::launch::async,
+                [prev, fn = std::forward<F>(f)]() mutable -> R {
+                    if constexpr (std::is_void_v<R>) {
+                        fn(prev.get());
+                    } else {
+                        return fn(prev.get());
+                    }
+                });
+
+            return legion_future<R>(std::move(next));
+        }
+
+    private:
+        std::shared_future<T> fut_;
+    };
+
+    template <>
+    class legion_future<void>
+    {
+    public:
+        legion_future() = default;
+
+        explicit legion_future(std::future<void>&& f)
+          : fut_(f.share())
+        {}
+
+        explicit legion_future(std::shared_future<void> f)
+          : fut_(std::move(f))
+        {}
+
+        void get() const
+        {
+            fut_.get();
+        }
+
+        template <typename F>
+        auto then(F&& f) const -> legion_future<std::invoke_result_t<F>>
+        {
+            using R = std::invoke_result_t<F>;
+            auto prev = fut_;
+
+            auto next = std::async(std::launch::async,
+                [prev, fn = std::forward<F>(f)]() mutable -> R {
+                    prev.get();
+                    if constexpr (std::is_void_v<R>) {
+                        fn();
+                    } else {
+                        return fn();
+                    }
+                });
+
+            return legion_future<R>(std::move(next));
+        }
+
+    private:
+        std::shared_future<void> fut_;
+    };
+
+    inline legion_future<void> make_ready_future()
+    {
+        std::promise<void> p;
+        p.set_value();
+        return legion_future<void>(p.get_future());
+    }
+
+    template <typename F, typename... Args>
+    auto legion_async(F&& f, Args&&... args)
+      -> legion_future<std::invoke_result_t<F, Args...>>
+    {
+        using R = std::invoke_result_t<F, Args...>;
+        auto fut = std::async(std::launch::async,
+            std::forward<F>(f), std::forward<Args>(args)...);
+        return legion_future<R>(std::move(fut));
+    }
+} // namespace astm
+
+// ASTM backend configuration (Legion-targeted)
+#define ASTM_MUTEX std::mutex
+#define ASTM_LOCK std::unique_lock<ASTM_MUTEX>
+#define ASTM_FUTURE ::astm::legion_future
+#define ASTM_FUNCTION std::function
+#define ASTM_ASYNC ::astm::legion_async
+#define ASTM_MAKE_READY_FUTURE ::astm::make_ready_future
+
+#define ASTM_TEST assert
+#define ASTM_REPORT 0
+
+#endif // ASTM_DBA88345_57B8_4CC8_A574_D5F007250E95
+
+// newer ASTM
+#if !defined(ASTM_65EB3381_65AE_4527_A4E5_A87D5014A33E)
+#define ASTM_65EB3381_65AE_4527_A4E5_A87D5014A33E
+
+#include "astm.hpp"
+
+namespace astm
+{
+}
+
+#endif
+```
+
+[binary_tree.cpp]
+```cpp
+////////////////////////////////////////////////////////////////////////////////
+//  Copyright (c) 2014 Bryce Adelstein-Lelbach
+//  Copyright (c) 2014 Steve Brandt
+//
+//  Distributed under the Boost Software License, Version 1.0. (See accompanying
+//  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+////////////////////////////////////////////////////////////////////////////////
+
+// Legion translation of binary_tree.cpp
+// - Replaces HPX entry with Legion top-level task runtime startup.
+// - Keeps ASTM transactional binary tree logic intact.
+
+#include <iostream>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <cstdint>
+
+#include "legion.h"
+#include "astm.hpp"
+
+using namespace astm;
+using namespace Legion;
+
+template <typename Key, typename Value>
+struct binary_tree
+{
+    struct node
+    {
+        shared_var<Key> key;
+        Value value;
+        shared_var<node*> left;
+        shared_var<node*> right;
+
+        node()
+          : key(), value(), left(), right()
+        {}
+
+        node(Key k, Value const& v, node* l, node* r)
+          : key(k), value(v), left(l), right(r)
+        {}
+
+        node(Key k, Value const& v, shared_var<node*> l, shared_var<node*> r)
+          : key(k), value(v), left(l), right(r)
+        {}
+
+        node(Key k, Value const& v)
+          : key(k), value(v), left(), right()
+        {}
+    };
+
+    binary_tree()
+      : root()
+    {}
+
+    void insert(Key key, Value const& value)
+    {
+        transaction t;
+        do {
+            auto root_ = root.get_local(t);
+
+            if (root_.get() != 0)
+                insert(key, value, root, t);
+            else
+                root_ = new node(key, value);
+        } while (!t.commit_transaction());
+    }
+
+    node* search(Key key)
+    {
+        node* n = nullptr;
+
+        transaction t;
+        do {
+            n = search(key, root, t);
+        } while (!t.commit_transaction());
+
+        return n;
+    }
+
+  private:
+    void insert(Key key, Value const& value, shared_var<node*>& leaf, transaction& t)
+    {
+        auto leaf_ = leaf.get_local(t);
+
+        if (key < leaf_.get()->key.get_local(t).get())
+        {
+            if (leaf_.get()->left.get_local(t).get() != 0)
+                insert(key, value, leaf_.get()->left, t);
+            else
+                leaf_.get()->left.get_local(t) = new node(key, value);
+        }
+        else
+        {
+            if (leaf_.get()->right.get_local(t).get() != 0)
+                insert(key, value, leaf_.get()->right, t);
+            else
+                leaf_.get()->right.get_local(t) = new node(key, value);
+        }
+    }
+
+    node* search(Key key, shared_var<node*>& leaf, transaction& t)
+    {
+        auto leaf_ = leaf.get_local(t);
+
+        if (leaf_.get() != 0)
+        {
+            if (key == leaf_.get()->key.get_local(t).get())
+                return leaf_.get();
+            if (key < leaf_.get()->key.get_local(t).get())
+                return search(key, leaf_.get()->left, t);
+            return search(key, leaf_.get()->right, t);
+        }
+
+        return 0;
+    }
+
+    shared_var<node*> root;
+};
+
+enum TaskIDs
+{
+    TOP_LEVEL_TASK_ID = 1
+};
+
+void top_level_task(
+    const Task* task,
+    const std::vector<PhysicalRegion>& regions,
+    Context ctx,
+    Runtime* runtime)
+{
+    (void)task;
+    (void)regions;
+    (void)ctx;
+    (void)runtime;
+
+    std::ofstream outfile("binary_tree.txt");
+    if (!outfile.is_open()) {
+        std::cerr << "Failed to open binary_tree.txt for writing." << std::endl;
+        return;
+    }
+
+    {
+        binary_tree<int, std::string> tree;
+
+        struct DataEntry {
+            int id;
+            std::string val;
+        };
+
+        std::vector<DataEntry> data = {
+            {50, "Root Node"},
+            {30, "Left Child"},
+            {70, "Right Child"},
+            {20, "Left-Left Grandchild"},
+            {40, "Left-Right Grandchild"},
+            {60, "Right-Left Grandchild"},
+            {80, "Right-Right Grandchild"}
+        };
+
+        outfile << "Inserting Data:\n";
+        for (const auto& entry : data) {
+            outfile << "  Insert(Key: " << entry.id << ", Value: \"" << entry.val << "\")" << std::endl;
+            tree.insert(entry.id, entry.val);
+        }
+        outfile << "\n";
+
+        outfile << "Running Search Tests:\n";
+
+        auto perform_search = [&](int search_key) {
+            outfile << "  Search(Key: " << search_key << ") -> ";
+
+            auto n = tree.search(search_key);
+
+            if (n != nullptr) {
+                outfile << "Found! Result Value: \"" << n->value << "\"\n";
+            } else {
+                outfile << "Not Found.\n";
+            }
+        };
+
+        perform_search(99);
+        perform_search(10);
+        perform_search(50);
+        perform_search(20);
+        perform_search(60);
+        perform_search(80);
+        perform_search(45);
+    }
+
+    outfile.close();
+}
+
+int main(int argc, char** argv)
+{
+    Runtime::set_top_level_task_id(TOP_LEVEL_TASK_ID);
+
+    {
+        TaskVariantRegistrar registrar(TOP_LEVEL_TASK_ID, "top_level_task");
+        registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        Runtime::preregister_task_variant<top_level_task>(registrar, "top_level_task");
+    }
+
+    // Keeps normal CLI behavior: running `./binary_tree` starts the Legion runtime.
+    return Runtime::start(argc, argv);
+}
+```
+
+[concurrency_tests.cpp]
+```cpp
+#include "legion.h"
+
+#include <fstream>
+#include <iostream>
+
+using namespace Legion;
+
+enum TaskIDs {
+  TOP_LEVEL_TASK_ID = 1,
+  INCREMENT_TASK_ID,
+  SQUARE_TASK_ID
+};
+
+enum FieldIDs {
+  FID_VALUE = 100
+};
+
+struct SharedIntRegion {
+  IndexSpace is;
+  FieldSpace fs;
+  LogicalRegion lr;
+};
+
+static SharedIntRegion create_shared_int_region(Context ctx, Runtime* runtime, int initial_value) {
+  SharedIntRegion r;
+
+  r.is = runtime->create_index_space(ctx, Rect<1>(0, 0));
+  r.fs = runtime->create_field_space(ctx);
+
+  {
+    FieldAllocator allocator = runtime->create_field_allocator(ctx, r.fs);
+    allocator.allocate_field(sizeof(int), FID_VALUE);
+  }
+
+  r.lr = runtime->create_logical_region(ctx, r.is, r.fs);
+
+  runtime->fill_field(ctx, r.lr, r.lr, FID_VALUE, &initial_value, sizeof(initial_value));
+  return r;
+}
+
+static void destroy_shared_int_region(Context ctx, Runtime* runtime, const SharedIntRegion& r) {
+  runtime->destroy_logical_region(ctx, r.lr);
+  runtime->destroy_field_space(ctx, r.fs);
+  runtime->destroy_index_space(ctx, r.is);
+}
+
+static int read_shared_int(Context ctx, Runtime* runtime, LogicalRegion lr) {
+  RegionRequirement req(lr, READ_ONLY, EXCLUSIVE, lr);
+  req.add_field(FID_VALUE);
+
+  InlineLauncher launcher(req);
+  PhysicalRegion pr = runtime->map_region(ctx, launcher);
+  pr.wait_until_valid();
+
+  const FieldAccessor<READ_ONLY, int, 1> acc(pr, FID_VALUE);
+  int value = acc[Point<1>(0)];
+
+  runtime->unmap_region(ctx, pr);
+  return value;
+}
+
+// A = A + 1
+void increment_task(const Task* task,
+                    const std::vector<PhysicalRegion>& regions,
+                    Context ctx, Runtime* runtime) {
+  (void)task;
+  (void)ctx;
+  (void)runtime;
+  const FieldAccessor<READ_WRITE, int, 1> acc(regions[0], FID_VALUE);
+  const Point<1> p(0); // single element
+  acc[p] = acc[p] + 1;
+}
+
+// A = A * A
+void square_task(const Task* task,
+                 const std::vector<PhysicalRegion>& regions,
+                 Context ctx, Runtime* runtime) {
+  (void)task;
+  (void)ctx;
+  (void)runtime;
+  const FieldAccessor<READ_WRITE, int, 1> acc(regions[0], FID_VALUE);
+  const Point<1> p(0); // single element
+  int v = acc[p];
+  acc[p] = v * v;
+}
+
+void top_level_task(const Task*,
+                    const std::vector<PhysicalRegion>&,
+                    Context ctx, Runtime* runtime) {
+  std::ofstream outfile("concurrency_tests.txt");
+  if (!outfile.is_open()) {
+    std::cerr << "Failed to open concurrency_tests.txt" << std::endl;
+    return;
+  }
+
+  // ---------------------------------------------------------
+  // TEST 1: High Concurrency Increment
+  // Goal: Ensure 64 tasks can atomically increment shared state.
+  // ---------------------------------------------------------
+  {
+    outfile << "Concurrency Increment Test\n";
+    outfile << "  Initial Value: 0\n";
+    outfile << "  Threads: 64\n";
+    outfile << "  Operation: A = A + 1\n";
+
+    SharedIntRegion data = create_shared_int_region(ctx, runtime, 0);
+
+    IndexSpace launch_is = runtime->create_index_space(ctx, Rect<1>(0, 63));
+    ArgumentMap arg_map;
+    IndexLauncher launcher(INCREMENT_TASK_ID, launch_is, TaskArgument(nullptr, 0), arg_map);
+
+    launcher.add_region_requirement(RegionRequirement(data.lr, READ_WRITE, EXCLUSIVE, data.lr));
+    launcher.region_requirements[0].add_field(FID_VALUE);
+
+    FutureMap fm = runtime->execute_index_space(ctx, launcher);
+    fm.wait_all_results();
+
+    int result = read_shared_int(ctx, runtime, data.lr);
+
+    outfile << "  Expected Result: 64\n";
+    outfile << "  Actual Result:   " << result << "\n";
+    outfile << "  Status: " << (result == 64 ? "PASS" : "FAIL") << "\n\n";
+
+    runtime->destroy_index_space(ctx, launch_is);
+    destroy_shared_int_region(ctx, runtime, data);
+  }
+
+  // ---------------------------------------------------------
+  // TEST 2: Exponential Growth (Squaring)
+  // Goal: Run 4 squaring transactions.
+  // 2 -> 4 -> 16 -> 256 -> 65536
+  // ---------------------------------------------------------
+  {
+    outfile << "Exponential Growth (Squaring) Test\n";
+    outfile << "  Initial Value: 2\n";
+    outfile << "  Threads: 4\n";
+    outfile << "  Operation: A = A * A\n";
+
+    SharedIntRegion data = create_shared_int_region(ctx, runtime, 2);
+
+    IndexSpace launch_is = runtime->create_index_space(ctx, Rect<1>(0, 3));
+    ArgumentMap arg_map;
+    IndexLauncher launcher(SQUARE_TASK_ID, launch_is, TaskArgument(nullptr, 0), arg_map);
+
+    launcher.add_region_requirement(RegionRequirement(data.lr, READ_WRITE, EXCLUSIVE, data.lr));
+    launcher.region_requirements[0].add_field(FID_VALUE);
+
+    FutureMap fm = runtime->execute_index_space(ctx, launcher);
+    fm.wait_all_results();
+
+    int result = read_shared_int(ctx, runtime, data.lr);
+
+    outfile << "  Expected Result: 65536\n";
+    outfile << "  Actual Result:   " << result << "\n";
+    outfile << "  Status: " << (result == 65536 ? "PASS" : "FAIL") << "\n";
+
+    runtime->destroy_index_space(ctx, launch_is);
+    destroy_shared_int_region(ctx, runtime, data);
+  }
+
+  outfile.close();
+}
+
+int main(int argc, char** argv) {
+  Runtime::set_top_level_task_id(TOP_LEVEL_TASK_ID);
+
+  {
+    TaskVariantRegistrar registrar(TOP_LEVEL_TASK_ID, "top_level_task");
+    registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+    Runtime::preregister_task_variant<top_level_task>(registrar, "top_level_task");
+  }
+  {
+    TaskVariantRegistrar registrar(INCREMENT_TASK_ID, "increment_task");
+    registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+    registrar.set_leaf();
+    Runtime::preregister_task_variant<increment_task>(registrar, "increment_task");
+  }
+  {
+    TaskVariantRegistrar registrar(SQUARE_TASK_ID, "square_task");
+    registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+    registrar.set_leaf();
+    Runtime::preregister_task_variant<square_task>(registrar, "square_task");
+  }
+
+  return Runtime::start(argc, argv);
+}
+```
+
+[unit_tests.cpp]
+```cpp
+////////////////////////////////////////////////////////////////////////////////
+//  Copyright (c) 2014 Bryce Adelstein-Lelbach
+//  Copyright (c) 2014 Steve Brandt
+//
+//  Distributed under the Boost Software License, Version 1.0. (See accompanying
+//  file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+////////////////////////////////////////////////////////////////////////////////
+
+// In addition to using ASTM_TEST, also have outfile piping for read() final
+// resulting values as well to play it extra safe against adversarial testing.
+
+#include <iostream>
+#include <fstream>
+
+#include "legion.h"
+#include "astm.hpp"
+
+using namespace Legion;
+using namespace astm;
+
+enum TaskIDs
+{
+    TOP_LEVEL_TASK_ID = 1
+};
+
+void top_level_task(
+    const Task* task,
+    const std::vector<PhysicalRegion>& regions,
+    Context ctx,
+    Runtime* runtime)
+{
+    (void)task;
+    (void)regions;
+    (void)ctx;
+    (void)runtime;
+
+    std::ofstream outfile("unit_tests.txt");
+    if (!outfile.is_open()) {
+        std::cerr << "Could not open unit_tests.txt" << std::endl;
+        return;
+    }
+
+    { // Read A, Write A
+        shared_var<int> A(1);
+        transaction t;
+        do {
+            auto A_ = A.get_local(t);
+            A_ = 2;
+        } while (!t.commit_transaction());
+
+        outfile << "Test (Read A, Write A): A = " << A.read() << std::endl;
+    }
+
+    { // Write A, Read A
+        shared_var<int> A(1);
+
+        transaction t;
+        do {
+            auto A_ = A.get_local(t);
+            A_ = 2;
+        } while (!t.commit_transaction());
+
+        outfile << "Test (Write A, Read A): A = " << A.read() << std::endl;
+    }
+
+    { // Write A, Write A
+        shared_var<int> A(1);
+
+        transaction t;
+        do {
+            auto A_ = A.get_local(t);
+            ASTM_TEST(A_ == 1);
+            ASTM_TEST(A_ == 1);
+        } while (!t.commit_transaction());
+
+        outfile << "Test (Write A, Write A): A = " << A.read() << std::endl;
+    }
+
+    { // Write A, Write A (overwrite)
+        shared_var<int> A(1);
+
+        transaction t;
+        do {
+            auto A_ = A.get_local(t);
+            A_ = 2;
+            A_ = 2;
+        } while (!t.commit_transaction());
+
+        outfile << "Test (Overwrite): A = " << A.read() << std::endl;
+    }
+
+    { // Read A, Write A, Read A
+        shared_var<int> A(1);
+
+        transaction t;
+        do {
+            auto A_ = A.get_local(t);
+            A_ = 2;
+        } while (!t.commit_transaction());
+
+        outfile << "Test (Read -> Write -> Read): A = " << A.read() << std::endl;
+    }
+
+    { // Write A, Read A, Write A
+        shared_var<int> A(1);
+
+        transaction t;
+        do {
+            auto A_ = A.get_local(t);
+            A_ = 2;
+            A_ = 2;
+        } while (!t.commit_transaction());
+
+        outfile << "Test (Write -> Read -> Write): A = " << A.read() << std::endl;
+    }
+
+    { // Basic arithmetic with local_vars.
+        shared_var<int> A(4);
+        shared_var<int> B(1);
+
+        // atomic { A = A*A - B; }
+        transaction t;
+        do {
+            auto A_ = A.get_local(t);
+            auto B_ = B.get_local(t);
+
+            A_ = A_ * A_ - B_;
+        } while (!t.commit_transaction());
+
+        outfile << "Test (Arithmetic): A = " << A.read()
+                << ", B = " << B.read() << std::endl;
+    }
+
+    { // Read A to future.
+        shared_var<int> A(4);
+        shared_var<int> B(1);
+
+        transaction t;
+        transaction_future IO(t);
+
+        do {
+            auto A_ = A.get_local(t);
+            auto B_ = B.get_local(t);
+
+            A_ = A_ * A_;
+
+            IO.then(
+                [local_A = int(A_)](transaction*) { ASTM_TEST(local_A == 16); }
+            );
+
+            A_ = A_ - B_;
+        } while (!t.commit_transaction());
+
+        IO.get();
+        outfile << "Test (Read A to Future): A = " << A.read()
+                << ", B = " << B.read() << std::endl;
+    }
+
+    {
+        shared_var<int> A(4);
+
+        // atomic { A = A*A; }
+        bool fail = true;
+        int attempt_count = 0;
+        transaction t;
+        do {
+            ++attempt_count;
+
+            auto A_ = A.get_local(t);
+
+            int tmp = A_ * A_;
+
+            if (fail) {
+                A.write(3);
+                fail = false;
+            }
+
+            A_ = tmp;
+        } while (!t.commit_transaction());
+
+        outfile << "Test (Retry Logic): A = " << A.read()
+                << ", Attempts = " << attempt_count << std::endl;
+    }
+
+    outfile.close();
+}
+
+int main(int argc, char** argv)
+{
+    Runtime::set_top_level_task_id(TOP_LEVEL_TASK_ID);
+
+    TaskVariantRegistrar registrar(TOP_LEVEL_TASK_ID, "unit_tests_top_level");
+    registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+    Runtime::preregister_task_variant<top_level_task>(
+        registrar, "unit_tests_top_level");
+
+    return Runtime::start(argc, argv);
+}
+```

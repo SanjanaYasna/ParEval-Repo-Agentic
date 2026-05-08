@@ -1,0 +1,892 @@
+[CMakeLists.txt]
+```cmake
+cmake_minimum_required(VERSION 3.14 FATAL_ERROR)
+project(osc_1d CXX)
+
+# Respect environment-provided package roots.
+if(DEFINED ENV{Legion_DIR} AND NOT Legion_DIR)
+  set(Legion_DIR "$ENV{Legion_DIR}")
+endif()
+
+if(DEFINED ENV{BOOST_ROOT} AND NOT BOOST_ROOT)
+  set(BOOST_ROOT "$ENV{BOOST_ROOT}")
+endif()
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Default to Release if not specified.
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+find_package(Legion REQUIRED CONFIG)
+find_package(Boost REQUIRED COMPONENTS program_options serialization)
+
+add_executable(odeint
+  odeint.cpp
+  shared_resize.hpp
+  algebra.hpp
+  shared_operations.hpp
+  system.hpp
+)
+
+target_compile_options(odeint PRIVATE -O3)
+target_include_directories(odeint PRIVATE ${Boost_INCLUDE_DIRS})
+
+# Link Legion (support common exported target names/fallback variables).
+if(TARGET Legion::Legion)
+  target_link_libraries(odeint PRIVATE Legion::Legion)
+elseif(TARGET Legion::legion)
+  target_link_libraries(odeint PRIVATE Legion::legion)
+elseif(TARGET legion)
+  target_link_libraries(odeint PRIVATE legion)
+elseif(DEFINED Legion_LIBRARIES)
+  target_include_directories(odeint PRIVATE ${Legion_INCLUDE_DIRS})
+  target_link_libraries(odeint PRIVATE ${Legion_LIBRARIES})
+else()
+  message(FATAL_ERROR "Legion was found, but no usable target/library was exposed.")
+endif()
+
+# Link Boost (prefer imported targets when available).
+if(TARGET Boost::program_options AND TARGET Boost::serialization)
+  target_link_libraries(odeint PRIVATE Boost::program_options Boost::serialization)
+else()
+  target_link_libraries(odeint PRIVATE ${Boost_LIBRARIES})
+endif()
+```
+
+[ReadMe.md]
+```markdown
+# Legion Oscillator Chain (ODEINT)
+
+The program integrates a 1D nonlinear oscillator chain with:
+
+- On-site potential exponent: `KAPPA = 3.5`
+- Coupling exponent: `LAMBDA = 4.5`
+
+Time integration is performed using boost::numeric::odeint::symplectic_rkn_sb3a_mclachlan which is a stepper suitable for Hamiltonian systems. (https://www.boost.org/doc/libs/1_88_0/boost/numeric/odeint/stepper/symplectic_rkn_sb3a_mclachlan.hpp)
+All energy calculation outputs are written to ```odeint.txt```. The compiled program executable should be called ```odeint```.
+
+### Prerequisites
+
+- Legion installed
+- A C++17-compliant C++ compiler (e.g. GCC, Clang) and beyond
+- Boost, which path is set as `BOOST_ROOT` and incorporated into `LD_LIBRARY_PATH`
+
+### Build
+
+Repository depends on Legion 25.06.0
+
+Make sure to set $LEGION_ROOT to Legion install directory 
+
+```
+mkdir build; cd build
+
+cmake ..
+
+make
+```
+
+### Run
+-----------------
+The program is controlled by four command-line parameters:
+
+--N (int)
+Total dimension of the oscillator chain. Default 1024
+
+--G (int)
+Block size (number of elements per task, officially termed as 'dataflow' as this was a translation from HPX). Defult 128
+
+--steps (int)
+Number of time integration steps. Default 100
+
+--dt (double) 
+Time step size, default 0.01
+
+The energy computations should return a rounded integer results of the computation. 
+
+Example Run:
+```bash
+> ./odeint --N 2048 --dt 0.1
+> cat odeint.txt
+Dimension: 2048, number of elements per dataflow: 128, number of dataflow: 16, steps: 100, dt: 0.1
+Initialization complete, energy: 341
+Integration complete, energy: 341
+```
+```
+
+[algebra.hpp]
+```cpp
+// Copyright 2013 Mario Mulansky
+#ifndef SHARED_ALGEBRA_HPP
+#define SHARED_ALGEBRA_HPP
+
+#include <cstddef>
+#include <cassert>
+
+// Legion translation note:
+// In HPX this algebra used dataflow futures for dependency tracking.
+// In Legion, dependencies are typically expressed through task launches
+// and region requirements, so this algebra performs the local element-wise
+// operation eagerly inside the executing task.
+struct local_dataflow_algebra
+{
+    // for now just a single state type
+    template <typename S, typename Op>
+    void for_each3(S &s1, const S &s2, const S &s3, Op op) const
+    {
+        assert(s1.size() == s2.size());
+        assert(s1.size() == s3.size());
+
+        const std::size_t N = s1.size();
+        for (std::size_t i = 0; i < N; ++i)
+        {
+            s1[i] = op(s1[i], s2[i], s3[i]);
+        }
+    }
+};
+
+#endif
+```
+
+[odeint.cpp]
+```cpp
+// Translated from HPX to Legion execution model (default mapper).
+// Example runs:
+//   ./odeint --N 2048 --dt 0.1
+//   ./odeint --N 2048 --dt 0.1 -ll:cpu 8   // parallel Legion workers
+
+#include "legion.h"
+
+#include <boost/program_options.hpp>
+
+#include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iostream>
+#include <random>
+
+using namespace Legion;
+
+namespace {
+
+constexpr double KAPPA  = 3.5;
+constexpr double LAMBDA = 4.5;
+
+enum TaskIDs {
+  TOP_LEVEL_TASK_ID = 1,
+  COMPUTE_DPDT_BLOCK_TASK_ID,
+  UPDATE_P_BLOCK_TASK_ID,
+  UPDATE_Q_BLOCK_TASK_ID
+};
+
+enum FieldIDs {
+  FID_Q = 100,
+  FID_P,
+  FID_DPDT
+};
+
+struct ComputeArgs {
+  int64_t N;
+};
+
+struct UpdateArgs {
+  double alpha;
+};
+
+inline double checked_pow(double x, double y) {
+  if (x == 0.0) return 0.0;
+  return std::pow(std::abs(x), y);
+}
+
+inline double signed_pow(double x, double k) {
+  if (x == 0.0) return 0.0;
+  return std::copysign(std::pow(std::abs(x), k), x);
+}
+
+double compute_energy(Runtime* runtime, Context ctx, LogicalRegion lr, IndexSpace is) {
+  InlineLauncher launcher(RegionRequirement(lr, READ_ONLY, EXCLUSIVE, lr));
+  launcher.add_field(FID_Q);
+  launcher.add_field(FID_P);
+
+  PhysicalRegion pr = runtime->map_region(ctx, launcher);
+  pr.wait_until_valid();
+
+  FieldAccessor<READ_ONLY, double, 1> q_acc(pr, FID_Q);
+  FieldAccessor<READ_ONLY, double, 1> p_acc(pr, FID_P);
+
+  Rect<1> rect = runtime->get_index_space_domain(ctx, is);
+  const int64_t lo = rect.lo[0];
+  const int64_t hi = rect.hi[0];
+  const int64_t N  = hi - lo + 1;
+
+  if (N <= 0) {
+    runtime->unmap_region(ctx, pr);
+    return 0.0;
+  }
+
+  double e = 0.0;
+
+  const double q0 = q_acc[Point<1>(lo)];
+  e += 0.5 * checked_pow(q0, LAMBDA) / LAMBDA;
+
+  for (int64_t i = lo; i < hi; ++i) {
+    const double qi  = q_acc[Point<1>(i)];
+    const double qip = q_acc[Point<1>(i + 1)];
+    const double pi  = p_acc[Point<1>(i)];
+
+    e += 0.5 * pi * pi
+       + checked_pow(qi, KAPPA) / KAPPA
+       + checked_pow(qi - qip, LAMBDA) / LAMBDA;
+  }
+
+  const double qn = q_acc[Point<1>(hi)];
+  const double pn = p_acc[Point<1>(hi)];
+  e += 0.5 * pn * pn
+     + checked_pow(qn, KAPPA) / KAPPA
+     + 0.5 * checked_pow(qn, LAMBDA) / LAMBDA;
+
+  runtime->unmap_region(ctx, pr);
+  return e;
+}
+
+void compute_dpdt_block_task(const Task* task,
+                             const std::vector<PhysicalRegion>& regions,
+                             Context ctx, Runtime* runtime) {
+  assert(regions.size() == 2);
+  const auto* args = static_cast<const ComputeArgs*>(task->args);
+  const int64_t N = args->N;
+
+  FieldAccessor<READ_ONLY, double, 1> q_acc(regions[0], FID_Q);
+  FieldAccessor<WRITE_DISCARD, double, 1> dpdt_acc(regions[1], FID_DPDT);
+
+  Rect<1> subrect =
+      runtime->get_index_space_domain(ctx, regions[1].get_logical_region().get_index_space());
+
+  for (PointInRectIterator<1> it(subrect); it(); it++) {
+    const int64_t i = static_cast<int64_t>((*it)[0]);
+    const double qi = q_acc[*it];
+
+    const double left =
+        (i == 0) ? -signed_pow(qi, LAMBDA - 1.0)
+                 : signed_pow(q_acc[Point<1>(i - 1)] - qi, LAMBDA - 1.0);
+
+    const double right =
+        (i == N - 1) ? signed_pow(qi, LAMBDA - 1.0)
+                     : signed_pow(qi - q_acc[Point<1>(i + 1)], LAMBDA - 1.0);
+
+    dpdt_acc[*it] = -signed_pow(qi, KAPPA - 1.0) + left - right;
+  }
+}
+
+void update_p_block_task(const Task* task,
+                         const std::vector<PhysicalRegion>& regions,
+                         Context ctx, Runtime* runtime) {
+  assert(regions.size() == 2);
+  const auto* args = static_cast<const UpdateArgs*>(task->args);
+
+  FieldAccessor<READ_WRITE, double, 1> p_acc(regions[0], FID_P);
+  FieldAccessor<READ_ONLY, double, 1> dpdt_acc(regions[1], FID_DPDT);
+
+  Rect<1> subrect =
+      runtime->get_index_space_domain(ctx, regions[0].get_logical_region().get_index_space());
+
+  for (PointInRectIterator<1> it(subrect); it(); it++) {
+    const double cur = p_acc[*it];
+    p_acc[*it] = cur + args->alpha * dpdt_acc[*it];
+  }
+}
+
+void update_q_block_task(const Task* task,
+                         const std::vector<PhysicalRegion>& regions,
+                         Context ctx, Runtime* runtime) {
+  assert(regions.size() == 2);
+  const auto* args = static_cast<const UpdateArgs*>(task->args);
+
+  FieldAccessor<READ_WRITE, double, 1> q_acc(regions[0], FID_Q);
+  FieldAccessor<READ_ONLY, double, 1> p_acc(regions[1], FID_P);
+
+  Rect<1> subrect =
+      runtime->get_index_space_domain(ctx, regions[0].get_logical_region().get_index_space());
+
+  for (PointInRectIterator<1> it(subrect); it(); it++) {
+    const double cur = q_acc[*it];
+    q_acc[*it] = cur + args->alpha * p_acc[*it];
+  }
+}
+
+void launch_compute_dpdt(Runtime* runtime, Context ctx, Domain launch_domain,
+                         LogicalRegion lr, LogicalPartition lp, int64_t N) {
+  ComputeArgs args{N};
+  IndexLauncher launcher(COMPUTE_DPDT_BLOCK_TASK_ID, launch_domain,
+                         TaskArgument(&args, sizeof(args)), ArgumentMap());
+
+  launcher.add_region_requirement(RegionRequirement(lr, READ_ONLY, EXCLUSIVE, lr));
+  launcher.region_requirements.back().add_field(FID_Q);
+
+  launcher.add_region_requirement(RegionRequirement(lp, 0 /* identity projection */,
+                                                   WRITE_DISCARD, EXCLUSIVE, lr));
+  launcher.region_requirements.back().add_field(FID_DPDT);
+
+  runtime->execute_index_space(ctx, launcher);
+}
+
+void launch_update_p(Runtime* runtime, Context ctx, Domain launch_domain,
+                     LogicalRegion lr, LogicalPartition lp, double alpha) {
+  UpdateArgs args{alpha};
+  IndexLauncher launcher(UPDATE_P_BLOCK_TASK_ID, launch_domain,
+                         TaskArgument(&args, sizeof(args)), ArgumentMap());
+
+  launcher.add_region_requirement(RegionRequirement(lp, 0, READ_WRITE, EXCLUSIVE, lr));
+  launcher.region_requirements.back().add_field(FID_P);
+
+  launcher.add_region_requirement(RegionRequirement(lp, 0, READ_ONLY, EXCLUSIVE, lr));
+  launcher.region_requirements.back().add_field(FID_DPDT);
+
+  runtime->execute_index_space(ctx, launcher);
+}
+
+void launch_update_q(Runtime* runtime, Context ctx, Domain launch_domain,
+                     LogicalRegion lr, LogicalPartition lp, double alpha) {
+  UpdateArgs args{alpha};
+  IndexLauncher launcher(UPDATE_Q_BLOCK_TASK_ID, launch_domain,
+                         TaskArgument(&args, sizeof(args)), ArgumentMap());
+
+  launcher.add_region_requirement(RegionRequirement(lp, 0, READ_WRITE, EXCLUSIVE, lr));
+  launcher.region_requirements.back().add_field(FID_Q);
+
+  launcher.add_region_requirement(RegionRequirement(lp, 0, READ_ONLY, EXCLUSIVE, lr));
+  launcher.region_requirements.back().add_field(FID_P);
+
+  runtime->execute_index_space(ctx, launcher);
+}
+
+void top_level_task(const Task*,
+                    const std::vector<PhysicalRegion>&,
+                    Context ctx, Runtime* runtime) {
+  namespace po = boost::program_options;
+
+  const InputArgs& args = Runtime::get_input_args();
+
+  po::options_description desc("Usage: odeint [options]");
+  desc.add_options()
+      ("help,h", "Show help")
+      ("N", po::value<std::size_t>()->default_value(1024), "Dimension (1024)")
+      ("G", po::value<std::size_t>()->default_value(128), "Block size (128)")
+      ("steps", po::value<std::size_t>()->default_value(100), "time steps (100)")
+      ("dt", po::value<double>()->default_value(0.01), "step size (0.01)");
+
+  po::variables_map vm;
+  auto parsed = po::command_line_parser(args.argc, args.argv)
+                    .options(desc)
+                    .allow_unregistered()
+                    .run();
+  po::store(parsed, vm);
+  po::notify(vm);
+
+  if (vm.count("help")) {
+    std::cout << desc << "\n";
+    std::cout << "Legion runtime options can be appended (e.g., -ll:cpu 8).\n";
+    return;
+  }
+
+  const std::size_t N_in = vm["N"].as<std::size_t>();
+  const std::size_t G_in = vm["G"].as<std::size_t>();
+  const std::size_t steps = vm["steps"].as<std::size_t>();
+  const double dt = vm["dt"].as<double>();
+
+  if (N_in == 0 || G_in == 0) {
+    std::cerr << "N and G must be > 0\n";
+    return;
+  }
+
+  const int64_t N = static_cast<int64_t>(N_in);
+  const int64_t G = static_cast<int64_t>(G_in);
+  const int64_t M = (N + G - 1) / G;
+
+  std::ofstream outfile("odeint.txt");
+  if (!outfile.is_open()) {
+    std::cerr << "Failed to open odeint.txt for writing.\n";
+    return;
+  }
+
+  outfile << "Dimension: " << N
+          << ", number of elements per dataflow: " << G
+          << ", number of dataflow: " << M
+          << ", steps: " << steps
+          << ", dt: " << dt << std::endl;
+
+  // Create region [0..N-1] with fields q, p, dpdt
+  IndexSpace is = runtime->create_index_space(ctx, Rect<1>(0, N - 1));
+
+  FieldSpace fs = runtime->create_field_space(ctx);
+  {
+    FieldAllocator allocator = runtime->create_field_allocator(ctx, fs);
+    allocator.allocate_field(sizeof(double), FID_Q);
+    allocator.allocate_field(sizeof(double), FID_P);
+    allocator.allocate_field(sizeof(double), FID_DPDT);
+  }
+
+  LogicalRegion lr = runtime->create_logical_region(ctx, is, fs);
+
+  // Partition into M blocks (contiguous, approximately equal)
+  IndexSpace color_is = runtime->create_index_space(ctx, Rect<1>(0, M - 1));
+  IndexPartition ip = runtime->create_equal_partition(ctx, is, color_is, 1 /*granularity*/);
+  LogicalPartition lp = runtime->get_logical_partition(ctx, lr, ip);
+  Domain launch_domain = runtime->get_index_space_domain(ctx, color_is);
+
+  // Initialize q=0 and dpdt=0
+  const double zero = 0.0;
+  runtime->fill_field(ctx, lr, lr, FID_Q, &zero, sizeof(zero));
+  runtime->fill_field(ctx, lr, lr, FID_DPDT, &zero, sizeof(zero));
+
+  // Initialize p with deterministic random numbers in [-1,1]
+  {
+    InlineLauncher init_p(RegionRequirement(lr, WRITE_DISCARD, EXCLUSIVE, lr));
+    init_p.add_field(FID_P);
+    PhysicalRegion pr = runtime->map_region(ctx, init_p);
+    pr.wait_until_valid();
+
+    FieldAccessor<WRITE_DISCARD, double, 1> p_acc(pr, FID_P);
+    Rect<1> rect = runtime->get_index_space_domain(ctx, is);
+
+    std::uniform_real_distribution<double> distribution(-1.0, 1.0);
+    std::mt19937 engine(0);
+
+    for (PointInRectIterator<1> it(rect); it(); it++) {
+      p_acc[*it] = distribution(engine);
+    }
+
+    runtime->unmap_region(ctx, pr);
+  }
+
+  const long long e_init = static_cast<long long>(std::llround(compute_energy(runtime, ctx, lr, is)));
+  outfile << "Initialization complete, energy: " << e_init << std::endl;
+
+  // Symplectic integration (velocity-Verlet):
+  // p += 0.5*dt*f(q), q += dt*p, p += 0.5*dt*f(q)
+  for (std::size_t s = 0; s < steps; ++s) {
+    launch_compute_dpdt(runtime, ctx, launch_domain, lr, lp, N);
+    launch_update_p(runtime, ctx, launch_domain, lr, lp, 0.5 * dt);
+    launch_update_q(runtime, ctx, launch_domain, lr, lp, dt);
+    launch_compute_dpdt(runtime, ctx, launch_domain, lr, lp, N);
+    launch_update_p(runtime, ctx, launch_domain, lr, lp, 0.5 * dt);
+  }
+
+  const long long e_final = static_cast<long long>(std::llround(compute_energy(runtime, ctx, lr, is)));
+  outfile << "Integration complete, energy: " << e_final << std::endl;
+
+  // Cleanup
+  runtime->destroy_logical_region(ctx, lr);
+  runtime->destroy_field_space(ctx, fs);
+  runtime->destroy_index_partition(ctx, ip);
+  runtime->destroy_index_space(ctx, color_is);
+  runtime->destroy_index_space(ctx, is);
+}
+
+} // end anonymous namespace
+
+int main(int argc, char** argv) {
+  Runtime::set_top_level_task_id(TOP_LEVEL_TASK_ID);
+
+  {
+    TaskVariantRegistrar registrar(TOP_LEVEL_TASK_ID, "top_level");
+    registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+    Runtime::preregister_task_variant<top_level_task>(registrar, "top_level");
+  }
+
+  {
+    TaskVariantRegistrar registrar(COMPUTE_DPDT_BLOCK_TASK_ID, "compute_dpdt_block");
+    registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+    registrar.set_leaf();
+    Runtime::preregister_task_variant<compute_dpdt_block_task>(registrar, "compute_dpdt_block");
+  }
+
+  {
+    TaskVariantRegistrar registrar(UPDATE_P_BLOCK_TASK_ID, "update_p_block");
+    registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+    registrar.set_leaf();
+    Runtime::preregister_task_variant<update_p_block_task>(registrar, "update_p_block");
+  }
+
+  {
+    TaskVariantRegistrar registrar(UPDATE_Q_BLOCK_TASK_ID, "update_q_block");
+    registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+    registrar.set_leaf();
+    Runtime::preregister_task_variant<update_q_block_task>(registrar, "update_q_block");
+  }
+
+  return Runtime::start(argc, argv);
+}
+```
+
+[shared_operations.hpp]
+```cpp
+// Copyright 2013 Mario Mulansky
+// Translated to a Legion-friendly backend (no HPX dependencies).
+#ifndef SHARED_OPERATIONS_HPP
+#define SHARED_OPERATIONS_HPP
+
+#include <vector>
+#include <memory>
+#include <cstddef>
+#include <cassert>
+
+typedef std::vector<double> dvec;
+typedef std::shared_ptr<dvec> shared_vec;
+
+// This operations policy is used by boost::numeric::odeint stepper internals.
+// In the Legion version, these functors are intended to run inside Legion tasks
+// on task-local block data.
+struct local_legion_shared_operations
+{
+    template <typename Fac1, typename Fac2 = Fac1>
+    struct scale_sum2
+    {
+        const Fac1 m_alpha1;
+        const Fac2 m_alpha2;
+
+        scale_sum2() : m_alpha1(0), m_alpha2(0) {}
+
+        scale_sum2(Fac1 alpha1, Fac2 alpha2)
+            : m_alpha1(alpha1), m_alpha2(alpha2)
+        { }
+
+        template <typename S1, typename S2, typename S3>
+        S1 operator()(S1 x1, const S2& x2, const S3& x3) const
+        {
+            assert(x1 && x2 && x3);
+            assert(x1->size() == x2->size());
+            assert(x1->size() == x3->size());
+
+            const std::size_t n = x1->size();
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                (*x1)[i] = m_alpha1 * (*x2)[i] + m_alpha2 * (*x3)[i];
+            }
+            return x1;
+        }
+    };
+};
+
+// Backward-compatible alias so existing code using the old HPX-oriented name
+// does not need to change immediately.
+using local_dataflow_shared_operations = local_legion_shared_operations;
+
+#endif
+```
+
+[shared_resize.hpp]
+```cpp
+// Copyright 2013 Mario Mulansky
+// resizing functionality for odeint
+// Translated from HPX futures/dataflow to Legion-oriented state storage.
+#ifndef SHARED_RESIZE_HPP
+#define SHARED_RESIZE_HPP
+
+#include <cstddef>
+#include <memory>
+#include <vector>
+
+#include <boost/numeric/odeint/util/is_resizeable.hpp>
+#include <boost/numeric/odeint/util/resize.hpp>
+#include <boost/numeric/odeint/util/same_size.hpp>
+#include <boost/numeric/odeint/util/state_wrapper.hpp>
+
+typedef std::vector<double> dvec;
+typedef std::shared_ptr<dvec> shared_vec;
+
+// In the Legion version, blocks are materialized directly.
+// Parallel execution is handled by Legion task launches elsewhere.
+typedef std::vector<shared_vec> state_type;
+
+namespace boost {
+namespace numeric {
+namespace odeint {
+
+template <>
+struct is_resizeable<state_type>
+{
+    typedef boost::true_type type;
+    static const bool value = type::value;
+};
+
+template <>
+struct same_size_impl<state_type, state_type>
+{
+    static bool same_size(const state_type& x1, const state_type& x2)
+    {
+        return (x1.size() == x2.size());
+    }
+};
+
+template <>
+struct resize_impl<state_type, state_type>
+{
+    static void resize(state_type& x1, const state_type& x2)
+    {
+        x1.resize(x2.size());
+        for (size_t i = 0; i < x2.size(); ++i)
+        {
+            const size_t n = (x2[i] ? x2[i]->size() : 0);
+            x1[i] = std::make_shared<dvec>(n);
+        }
+    }
+};
+
+} // namespace odeint
+} // namespace numeric
+} // namespace boost
+
+#endif
+```
+
+[system.hpp]
+```cpp
+// Copyright 2013 Mario Mulansky
+// Translated from HPX dataflow model to Legion task/future model.
+
+#ifndef SYSTEM_HPP
+#define SYSTEM_HPP
+
+#include <legion.h>
+
+#include <vector>
+#include <memory>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <cassert>
+
+const double KAPPA = 3.5;
+const double LAMBDA = 4.5;
+
+namespace checked_math {
+inline double pow(double x, double y) {
+  if (x == 0.0) return 0.0;
+  using std::abs;
+  using std::pow;
+  return pow(abs(x), y);
+}
+}  // namespace checked_math
+
+inline double signed_pow(double x, double k) {
+  const double s = (x > 0.0) ? 1.0 : ((x < 0.0) ? -1.0 : 0.0);
+  return checked_math::pow(x, k) * s;
+}
+
+typedef std::vector<double> dvec;
+typedef std::shared_ptr<dvec> shared_vec;
+
+// In Legion translation, each block is represented as a Future containing a serialized dvec.
+typedef std::vector<Legion::Future> state_type;
+
+enum : Legion::TaskID {
+  SYSTEM_BLOCK_TASK_ID = 1001
+};
+
+enum BlockKind : int {
+  BLOCK_FIRST  = 0,
+  BLOCK_CENTER = 1,
+  BLOCK_LAST   = 2,
+  BLOCK_SINGLE = 3
+};
+
+struct BlockTaskArgs {
+  int kind;
+};
+
+inline dvec deserialize_dvec(const void* buffer, size_t bytes) {
+  Legion::Deserializer dez(buffer, bytes);
+  size_t n = 0;
+  dez.deserialize(n);
+  dvec out(n);
+  for (size_t i = 0; i < n; ++i) dez.deserialize(out[i]);
+  return out;
+}
+
+inline dvec future_to_dvec(const Legion::Future& f) {
+  const void* buffer = f.get_untyped_pointer();
+  const size_t bytes = f.get_untyped_size();
+  return deserialize_dvec(buffer, bytes);
+}
+
+inline Legion::TaskResult dvec_to_task_result(const dvec& v) {
+  Legion::Serializer rez;
+  const size_t n = v.size();
+  rez.serialize(n);
+  for (size_t i = 0; i < n; ++i) rez.serialize(v[i]);
+
+  void* out = std::malloc(rez.get_used_bytes());
+  std::memcpy(out, rez.get_buffer(), rez.get_used_bytes());
+  return Legion::TaskResult(out, rez.get_used_bytes(), true /*owned*/);
+}
+
+inline dvec compute_block_dpdt(const dvec& q, double q_l, double q_r) {
+  const size_t N = q.size();
+  dvec dpdt(N, 0.0);
+  if (N == 0) return dpdt;
+
+  double coupling_lr = -signed_pow(q[0] - q_l, LAMBDA - 1.0);
+  for (size_t i = 0; i < N - 1; ++i) {
+    dpdt[i] = -signed_pow(q[i], KAPPA - 1.0) + coupling_lr;
+    coupling_lr = signed_pow(q[i] - q[i + 1], LAMBDA - 1.0);
+    dpdt[i] -= coupling_lr;
+  }
+
+  dpdt[N - 1] = -signed_pow(q[N - 1], KAPPA - 1.0)
+              + coupling_lr
+              - signed_pow(q[N - 1] - q_r, LAMBDA - 1.0);
+  return dpdt;
+}
+
+inline Legion::TaskResult system_block_task(
+    const Legion::Task* task,
+    const std::vector<Legion::PhysicalRegion>&,
+    Legion::Context,
+    Legion::Runtime*) {
+  const auto* args = static_cast<const BlockTaskArgs*>(task->args);
+  const int kind = args->kind;
+
+  // futures layout:
+  // first  : [q_i, q_{i+1}]
+  // center : [q_i, q_{i-1}, q_{i+1}]
+  // last   : [q_i, q_{i-1}]
+  // single : [q_i]
+  dvec q = future_to_dvec(task->futures[0]);
+
+  double q_l = 0.0, q_r = 0.0;
+  if (kind == BLOCK_FIRST) {
+    dvec qr = future_to_dvec(task->futures[1]);
+    q_r = qr.front();
+  } else if (kind == BLOCK_CENTER) {
+    dvec ql = future_to_dvec(task->futures[1]);
+    dvec qr = future_to_dvec(task->futures[2]);
+    q_l = ql.back();
+    q_r = qr.front();
+  } else if (kind == BLOCK_LAST) {
+    dvec ql = future_to_dvec(task->futures[1]);
+    q_l = ql.back();
+  }  // BLOCK_SINGLE keeps q_l=q_r=0
+
+  dvec dpdt = compute_block_dpdt(q, q_l, q_r);
+  return dvec_to_task_result(dpdt);
+}
+
+// Must be called before Runtime::start(...)
+inline void preregister_system_tasks() {
+  static bool done = false;
+  if (done) return;
+  done = true;
+
+  Legion::TaskVariantRegistrar registrar(SYSTEM_BLOCK_TASK_ID, "system_block_task");
+  registrar.add_constraint(Legion::ProcessorConstraint(Legion::Processor::LOC_PROC));
+  registrar.set_leaf();
+  Legion::Runtime::preregister_task_variant<system_block_task>(registrar, "system_block_task");
+}
+
+inline Legion::Context& system_ctx_ref() {
+  static Legion::Context ctx = nullptr;
+  return ctx;
+}
+
+inline Legion::Runtime*& system_rt_ref() {
+  static Legion::Runtime* rt = nullptr;
+  return rt;
+}
+
+// Must be called from a Legion task context (e.g., top-level task) before osc_chain usage.
+inline void bind_system_runtime(Legion::Context ctx, Legion::Runtime* runtime) {
+  system_ctx_ref() = ctx;
+  system_rt_ref() = runtime;
+}
+
+inline void osc_chain(state_type& q, state_type& dpdt) {
+  Legion::Runtime* runtime = system_rt_ref();
+  Legion::Context ctx = system_ctx_ref();
+  assert(runtime != nullptr && "bind_system_runtime must be called before osc_chain");
+  assert(ctx != nullptr && "bind_system_runtime must be called before osc_chain");
+
+  const size_t N = q.size();
+  dpdt.resize(N);
+  if (N == 0) return;
+
+  for (size_t i = 0; i < N; ++i) {
+    BlockTaskArgs args{};
+    Legion::TaskLauncher launcher(
+        SYSTEM_BLOCK_TASK_ID,
+        Legion::TaskArgument(&args, sizeof(args)));
+
+    if (N == 1) {
+      args.kind = BLOCK_SINGLE;
+      launcher = Legion::TaskLauncher(
+          SYSTEM_BLOCK_TASK_ID, Legion::TaskArgument(&args, sizeof(args)));
+      launcher.add_future(q[i]);
+    } else if (i == 0) {
+      args.kind = BLOCK_FIRST;
+      launcher = Legion::TaskLauncher(
+          SYSTEM_BLOCK_TASK_ID, Legion::TaskArgument(&args, sizeof(args)));
+      launcher.add_future(q[i]);
+      launcher.add_future(q[i + 1]);
+    } else if (i + 1 == N) {
+      args.kind = BLOCK_LAST;
+      launcher = Legion::TaskLauncher(
+          SYSTEM_BLOCK_TASK_ID, Legion::TaskArgument(&args, sizeof(args)));
+      launcher.add_future(q[i]);
+      launcher.add_future(q[i - 1]);
+    } else {
+      args.kind = BLOCK_CENTER;
+      launcher = Legion::TaskLauncher(
+          SYSTEM_BLOCK_TASK_ID, Legion::TaskArgument(&args, sizeof(args)));
+      launcher.add_future(q[i]);
+      launcher.add_future(q[i - 1]);
+      launcher.add_future(q[i + 1]);
+    }
+
+    dpdt[i] = runtime->execute_task(ctx, launcher);
+  }
+}
+
+inline void osc_chain_gb(state_type& q, state_type& dpdt) {
+  osc_chain(q, dpdt);
+  for (auto& f : dpdt) {
+    (void)f.get_untyped_size(); // wait
+  }
+}
+
+inline double energy(const dvec& q, const dvec& p) {
+  using checked_math::pow;
+  using std::abs;
+  const size_t N = q.size();
+  if (N == 0) return 0.0;
+
+  double e = 0.5 * pow(abs(q[0]), LAMBDA) / LAMBDA;
+  for (size_t i = 0; i < N - 1; ++i) {
+    e += 0.5 * p[i] * p[i]
+       + pow(q[i], KAPPA) / KAPPA
+       + pow(abs(q[i] - q[i + 1]), LAMBDA) / LAMBDA;
+  }
+  e += 0.5 * p[N - 1] * p[N - 1]
+     + pow(q[N - 1], KAPPA) / KAPPA
+     + 0.5 * pow(abs(q[N - 1]), LAMBDA) / LAMBDA;
+  return e;
+}
+
+template <typename S>
+double energy(const S& q_fut, const S& p_fut) {
+  dvec q, p;
+  for (size_t i = 0; i < q_fut.size(); ++i) {
+    dvec q_blk = future_to_dvec(q_fut[i]);
+    dvec p_blk = future_to_dvec(p_fut[i]);
+    q.insert(q.end(), q_blk.begin(), q_blk.end());
+    p.insert(p.end(), p_blk.begin(), p_blk.end());
+  }
+  return energy(q, p);
+}
+
+#endif
+```
