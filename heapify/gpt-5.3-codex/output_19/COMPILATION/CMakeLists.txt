@@ -1,23 +1,41 @@
-cmake_minimum_required(VERSION 3.22 FATAL_ERROR)
-project(heap CXX)
+cmake_minimum_required(VERSION 3.14 FATAL_ERROR)
 
-if(POLICY CMP0144)
-cmake_policy(SET CMP0144 NEW)
+project(heap_legion LANGUAGES CXX)
+
+# Honor environment-provided package locations
+if(DEFINED ENV{Legion_DIR} AND NOT Legion_DIR)
+  set(Legion_DIR "$ENV{Legion_DIR}")
 endif()
 
-# Only search if we're building stand-alone and not as part of Legion
-# Make sure Legion_DIR env variable points towards the .cmake configs
-if(NOT Legion_SOURCE_DIR)
-find_package(Legion REQUIRED)
+if(DEFINED ENV{BOOST_ROOT} AND NOT BOOST_ROOT)
+  set(BOOST_ROOT "$ENV{BOOST_ROOT}")
 endif()
 
-# Added because some generated code uses Boost libraries like program options
-find_package(Boost REQUIRED COMPONENTS system thread filesystem program_options)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_executable(heaps heaps.cpp)
-target_link_libraries(heaps Legion::Legion Boost::program_options)
-target_compile_options(heaps PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${CXX_BUILD_WARNING_FLAGS}>)
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
 
-if(Legion_ENABLE_TESTING)
-add_test(NAME heaps COMMAND ${Legion_TEST_LAUNCHER} $<TARGET_FILE:heaps> ${Legion_TEST_ARGS})
+find_package(Legion REQUIRED CONFIG)
+find_package(Boost REQUIRED COMPONENTS program_options)
+
+add_executable(heaps
+  heaps.cpp
+  sift.hpp
+)
+
+target_compile_options(heaps PRIVATE -O3)
+
+# Link against Legion (support common exported target names)
+if(TARGET Legion::Legion)
+  target_link_libraries(heaps PRIVATE Legion::Legion Boost::program_options)
+elseif(TARGET legion)
+  target_link_libraries(heaps PRIVATE legion Boost::program_options)
+elseif(TARGET Legion)
+  target_link_libraries(heaps PRIVATE Legion Boost::program_options)
+else()
+  message(FATAL_ERROR "Could not find a known Legion CMake target (Legion::Legion / legion / Legion).")
 endif()

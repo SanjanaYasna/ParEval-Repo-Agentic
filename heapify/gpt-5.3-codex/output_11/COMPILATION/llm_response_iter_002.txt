@@ -1,0 +1,549 @@
+[CMakeLists.txt]
+```cmake
+cmake_minimum_required(VERSION 3.14 FATAL_ERROR)
+project(heaps LANGUAGES CXX)
+
+if(POLICY CMP0144)
+  cmake_policy(SET CMP0144 NEW)
+endif()
+if(POLICY CMP0167)
+  cmake_policy(SET CMP0167 OLD)
+endif()
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Use Legion_DIR from environment if provided
+if(DEFINED ENV{Legion_DIR} AND NOT DEFINED Legion_DIR)
+  set(Legion_DIR "$ENV{Legion_DIR}" CACHE PATH "Path to Legion CMake config")
+endif()
+
+# Also support LEGION_ROOT by deriving Legion_DIR
+if(DEFINED ENV{LEGION_ROOT} AND NOT DEFINED Legion_DIR)
+  if(EXISTS "$ENV{LEGION_ROOT}/lib/cmake/Legion")
+    set(Legion_DIR "$ENV{LEGION_ROOT}/lib/cmake/Legion" CACHE PATH "Path to Legion CMake config")
+  elseif(EXISTS "$ENV{LEGION_ROOT}/share/Legion/cmake")
+    set(Legion_DIR "$ENV{LEGION_ROOT}/share/Legion/cmake" CACHE PATH "Path to Legion CMake config")
+  endif()
+endif()
+
+find_package(Legion REQUIRED CONFIG)
+find_package(Boost REQUIRED COMPONENTS program_options)
+
+add_executable(heaps
+  heaps.cpp
+  sift.hpp
+)
+
+# Keep optimization behavior similar to the original project
+target_compile_options(heaps PRIVATE -O3 -w)
+
+# Link Legion (handle common package export styles)
+if(TARGET Legion::Legion)
+  target_link_libraries(heaps PRIVATE Legion::Legion)
+elseif(TARGET legion)
+  target_link_libraries(heaps PRIVATE legion)
+elseif(DEFINED Legion_LIBRARIES)
+  target_link_libraries(heaps PRIVATE ${Legion_LIBRARIES})
+else()
+  message(FATAL_ERROR "Legion found, but no known Legion target/library was exported.")
+endif()
+
+# Include dirs if provided by package variables
+if(DEFINED Legion_INCLUDE_DIRS)
+  target_include_directories(heaps PRIVATE ${Legion_INCLUDE_DIRS})
+endif()
+
+# Boost program_options
+if(TARGET Boost::program_options)
+  target_link_libraries(heaps PRIVATE Boost::program_options)
+else()
+  target_include_directories(heaps PRIVATE ${Boost_INCLUDE_DIRS})
+  target_link_libraries(heaps PRIVATE ${Boost_LIBRARIES})
+endif()
+```
+
+[ReadMe.md]
+```markdown
+WIP (Work-in-progress) level parallelism based algorithm for the implementation of `make_heap`
+within Legion parallel algorithms library. The goal of this prototype is to experiment with a *bottom‑up, level‑parallel* heap
+construction strategy using futures and to explore how chunking
+and synchronization between tree levels work. All benchmark results are written to `heaps.txt`. The compiled program executable should be called ```heaps```.
+
+### Prerequisites
+
+- Legion installed
+- A C++17-compliant C++ compiler (e.g. GCC, Clang) and beyond
+- Boost, which path is set as `BOOST_ROOT` and incorporated into `LD_LIBRARY_PATH`
+
+
+### Build
+
+Repository depends on Legion 25.06.0
+
+Make sure to set $LEGION_ROOT to Legion install directory 
+
+```
+mkdir build; cd build
+
+cmake ..
+
+make
+```
+
+### Run
+-----------------
+The heaps benchmark is controlled by two command-line options:
+
+--vector_size (int)
+Number of elements in the input vector. The vector is initialized as
+0, 1, 2, ..., vector_size - 1.
+
+--chunk_size (int)
+Number of heap nodes processed per task at each tree level.
+If chunk_size > 0, it directly controls the per-task work size.
+If chunk_size == 0 (default), it is chosen automatically as
+vector_size / (number of worker threads).
+
+Example Run: 
+```bash
+> ./heaps --vector_size 999999 --chunk_size 1000
+> cat heaps.txt
+First 10 elements: 999998 786430 999997 655358 786429 917502 999996 589822 655357 720894
+Last 10 elements: 60 124997 3905 1952 975 7811 487 31248 15623 124998
+Sum of all elements: 499998500001
+Root (max) element: 999998
+Is valid heap: true
+```
+
+
+
+```
+
+[heaps.cpp]
+```cpp
+#include "legion.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <cstddef>
+#include <fstream>
+#include <iostream>
+#include <numeric>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "sift.hpp"
+
+using namespace Legion;
+
+enum TaskIDs
+{
+  TOP_LEVEL_TASK_ID = 1,
+  SIFT_RANGE_TASK_ID
+};
+
+enum FieldIDs
+{
+  FID_VAL = 1
+};
+
+struct SiftRangeArgs
+{
+  std::int64_t len;
+  std::int64_t start_idx;
+  std::size_t count;
+};
+
+struct ProgramOptions
+{
+  std::size_t vector_size = 25;
+  std::size_t chunk_size = 0;
+};
+
+static bool parse_size_t(const std::string &s, std::size_t &out)
+{
+  try
+  {
+    std::size_t pos = 0;
+    unsigned long long v = std::stoull(s, &pos);
+    if (pos != s.size()) return false;
+    out = static_cast<std::size_t>(v);
+    return true;
+  }
+  catch (...)
+  {
+    return false;
+  }
+}
+
+static ProgramOptions parse_options(int argc, char **argv)
+{
+  ProgramOptions opts;
+
+  for (int i = 1; i < argc; ++i)
+  {
+    std::string arg(argv[i]);
+
+    if (arg == "--vector_size" && i + 1 < argc)
+    {
+      std::size_t parsed = 0;
+      if (parse_size_t(argv[i + 1], parsed)) opts.vector_size = parsed;
+      ++i;
+    }
+    else if (arg.rfind("--vector_size=", 0) == 0)
+    {
+      std::size_t parsed = 0;
+      if (parse_size_t(arg.substr(std::string("--vector_size=").size()), parsed))
+        opts.vector_size = parsed;
+    }
+    else if (arg == "--chunk_size" && i + 1 < argc)
+    {
+      std::size_t parsed = 0;
+      if (parse_size_t(argv[i + 1], parsed)) opts.chunk_size = parsed;
+      ++i;
+    }
+    else if (arg.rfind("--chunk_size=", 0) == 0)
+    {
+      std::size_t parsed = 0;
+      if (parse_size_t(arg.substr(std::string("--chunk_size=").size()), parsed))
+        opts.chunk_size = parsed;
+    }
+  }
+
+  return opts;
+}
+
+static std::size_t get_available_cpu_processors()
+{
+  Machine machine = Machine::get_machine();
+  Machine::ProcessorQuery pq(machine);
+  pq.only_kind(Processor::LOC_PROC);
+
+  std::size_t count = 0;
+  for (auto it = pq.begin(); it != pq.end(); ++it)
+    ++count;
+
+  return std::max<std::size_t>(1, count);
+}
+
+static std::ptrdiff_t highest_power_of_two_leq(std::ptrdiff_t x)
+{
+  // x > 0 expected
+  std::uint64_t v = static_cast<std::uint64_t>(x);
+  std::uint64_t p = 1;
+  while ((p << 1) <= v)
+    p <<= 1;
+  return static_cast<std::ptrdiff_t>(p);
+}
+
+void write_heap_characteristics(const std::vector<int> &v)
+{
+  std::ofstream outFile("heaps.txt");
+
+  const std::size_t print_count = std::min<std::size_t>(v.size(), 10);
+
+  outFile << "First " << print_count << " elements: ";
+  for (std::size_t i = 0; i < print_count; ++i)
+  {
+    outFile << v[i];
+    if (i + 1 < print_count) outFile << " ";
+  }
+
+  outFile << "\n";
+  outFile << "Last " << print_count << " elements: ";
+  if (!v.empty())
+  {
+    std::size_t start_last = (v.size() > print_count) ? (v.size() - print_count) : 0;
+    for (std::size_t i = start_last; i < v.size(); ++i)
+    {
+      outFile << v[i];
+      if (i + 1 < v.size()) outFile << " ";
+    }
+  }
+
+  outFile << "\n";
+  long long sum = std::accumulate(v.begin(), v.end(), 0LL);
+  outFile << "Sum of all elements: " << sum << "\n";
+
+  if (!v.empty())
+    outFile << "Root (max) element: " << v[0] << "\n";
+
+  bool is_valid_heap = std::is_heap(v.begin(), v.end());
+  outFile << "Is valid heap: " << (is_valid_heap ? "true" : "false") << "\n";
+}
+
+void sift_range_task(const Task *task,
+                     const std::vector<PhysicalRegion> &regions,
+                     Context ctx,
+                     Runtime *runtime)
+{
+  const SiftRangeArgs *args = static_cast<const SiftRangeArgs *>(task->args);
+  if (args == nullptr || args->len <= 1 || args->count == 0) return;
+
+  const std::ptrdiff_t len = static_cast<std::ptrdiff_t>(args->len);
+  const std::ptrdiff_t start_idx = static_cast<std::ptrdiff_t>(args->start_idx);
+  if (start_idx < 0 || start_idx >= len) return;
+
+  using RWAccessor =
+      FieldAccessor<READ_WRITE, int, 1, coord_t, Realm::AffineAccessor<int, 1, coord_t>>;
+
+  RWAccessor acc(regions[0], FID_VAL);
+
+  Domain domain = runtime->get_index_space_domain(ctx, task->regions[0].region.get_index_space());
+  Rect<1> rect = domain.bounds<1, coord_t>();
+
+  int *base = acc.ptr(rect.lo);
+
+  std::size_t safe_count = std::min<std::size_t>(args->count, static_cast<std::size_t>(start_idx + 1));
+  sift_down_range<int *, std::less<int>>(
+      base, base + len, std::less<int>{}, len, base + start_idx, safe_count);
+}
+
+static void make_heap_legion(Runtime *runtime,
+                             Context ctx,
+                             LogicalRegion lr,
+                             std::size_t n,
+                             std::size_t chunk_size)
+{
+  if (n <= 1) return;
+
+  const std::ptrdiff_t len = static_cast<std::ptrdiff_t>(n);
+
+  for (std::ptrdiff_t level_last = (len - 2) / 2; level_last > 0;)
+  {
+    const std::ptrdiff_t level_first = highest_power_of_two_leq(level_last + 1) - 1;
+    const std::size_t items = static_cast<std::size_t>(level_last - level_first + 1);
+
+    std::size_t level_chunk = chunk_size;
+    if (level_chunk == 0 || level_chunk > items) level_chunk = items;
+    if (level_chunk == 0) level_chunk = 1;
+
+    std::vector<Future> futures;
+    futures.reserve((items + level_chunk - 1) / level_chunk);
+
+    std::size_t cnt = 0;
+    while (cnt < items)
+    {
+      std::size_t this_count = std::min(level_chunk, items - cnt);
+      SiftRangeArgs args{
+          static_cast<std::int64_t>(len),
+          static_cast<std::int64_t>(level_last - static_cast<std::ptrdiff_t>(cnt)),
+          this_count};
+
+      TaskLauncher launcher(SIFT_RANGE_TASK_ID, TaskArgument(&args, sizeof(args)));
+      RegionRequirement rr(lr, READ_WRITE, SIMULTANEOUS, lr);
+      rr.add_field(FID_VAL);
+      launcher.add_region_requirement(rr);
+
+      futures.emplace_back(runtime->execute_task(ctx, launcher));
+      cnt += this_count;
+    }
+
+    for (auto &f : futures)
+      f.get_void_result();
+
+    level_last = level_first - 1;
+  }
+
+  // Sift down the root node
+  SiftRangeArgs root_args{
+      static_cast<std::int64_t>(len),
+      0,
+      1};
+
+  TaskLauncher root_launcher(SIFT_RANGE_TASK_ID, TaskArgument(&root_args, sizeof(root_args)));
+  RegionRequirement root_rr(lr, READ_WRITE, EXCLUSIVE, lr);
+  root_rr.add_field(FID_VAL);
+  root_launcher.add_region_requirement(root_rr);
+  runtime->execute_task(ctx, root_launcher).get_void_result();
+}
+
+void top_level_task(const Task *,
+                    const std::vector<PhysicalRegion> &,
+                    Context ctx,
+                    Runtime *runtime)
+{
+  const InputArgs &in = Runtime::get_input_args();
+  ProgramOptions opts = parse_options(in.argc, in.argv);
+
+  std::size_t vector_size = opts.vector_size;
+  std::size_t chunk_size = opts.chunk_size;
+
+  if (chunk_size == 0)
+  {
+    std::size_t threads = get_available_cpu_processors();
+    chunk_size = (threads > 0) ? (vector_size / threads) : vector_size;
+    if (chunk_size == 0) chunk_size = 1;
+  }
+
+  if (vector_size == 0)
+  {
+    write_heap_characteristics(std::vector<int>{});
+    return;
+  }
+
+  Rect<1> elem_rect(0, static_cast<coord_t>(vector_size - 1));
+  IndexSpace is = runtime->create_index_space(ctx, elem_rect);
+
+  FieldSpace fs = runtime->create_field_space(ctx);
+  {
+    FieldAllocator allocator = runtime->create_field_allocator(ctx, fs);
+    allocator.allocate_field(sizeof(int), FID_VAL);
+  }
+
+  LogicalRegion lr = runtime->create_logical_region(ctx, is, fs);
+
+  // Initialize v[i] = i
+  {
+    RegionRequirement req(lr, WRITE_DISCARD, EXCLUSIVE, lr);
+    req.add_field(FID_VAL);
+    InlineLauncher launcher(req);
+    PhysicalRegion pr = runtime->map_region(ctx, launcher);
+    pr.wait_until_valid();
+
+    using WDAccessor =
+        FieldAccessor<WRITE_DISCARD, int, 1, coord_t, Realm::AffineAccessor<int, 1, coord_t>>;
+    WDAccessor acc(pr, FID_VAL);
+
+    Domain domain = runtime->get_index_space_domain(ctx, is);
+    Rect<1> rect = domain.bounds<1, coord_t>();
+    int *base = acc.ptr(rect.lo);
+
+    for (std::size_t i = 0; i < vector_size; ++i)
+      base[i] = static_cast<int>(i);
+
+    runtime->unmap_region(ctx, pr);
+  }
+
+  make_heap_legion(runtime, ctx, lr, vector_size, chunk_size);
+
+  // Copy result back to std::vector for output and validation
+  std::vector<int> v(vector_size);
+  {
+    RegionRequirement req(lr, READ_ONLY, EXCLUSIVE, lr);
+    req.add_field(FID_VAL);
+    InlineLauncher launcher(req);
+    PhysicalRegion pr = runtime->map_region(ctx, launcher);
+    pr.wait_until_valid();
+
+    using ROAccessor =
+        FieldAccessor<READ_ONLY, int, 1, coord_t, Realm::AffineAccessor<int, 1, coord_t>>;
+    ROAccessor acc(pr, FID_VAL);
+
+    Domain domain = runtime->get_index_space_domain(ctx, is);
+    Rect<1> rect = domain.bounds<1, coord_t>();
+    const int *base = acc.ptr(rect.lo);
+
+    std::copy(base, base + vector_size, v.begin());
+    runtime->unmap_region(ctx, pr);
+  }
+
+  write_heap_characteristics(v);
+
+  runtime->destroy_logical_region(ctx, lr);
+  runtime->destroy_field_space(ctx, fs);
+  runtime->destroy_index_space(ctx, is);
+}
+
+int main(int argc, char **argv)
+{
+  Runtime::set_top_level_task_id(TOP_LEVEL_TASK_ID);
+
+  {
+    TaskVariantRegistrar registrar(TOP_LEVEL_TASK_ID, "top_level_task");
+    registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+    Runtime::preregister_task_variant<top_level_task>(registrar, "top_level_task");
+  }
+
+  {
+    TaskVariantRegistrar registrar(SIFT_RANGE_TASK_ID, "sift_range_task");
+    registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+    registrar.set_leaf();
+    Runtime::preregister_task_variant<sift_range_task>(registrar, "sift_range_task");
+  }
+
+  return Runtime::start(argc, argv);
+}
+```
+
+[sift.hpp]
+```cpp
+#pragma once
+
+#include <cstddef>
+#include <iterator>
+#include <utility>
+
+// Runtime-agnostic heap primitives.
+// In the Legion version, these are intended to be called from Legion tasks.
+
+template <typename RndIter, typename Pred>
+inline void sift_down(
+    RndIter first,
+    RndIter /*last*/,
+    const Pred& pred,
+    typename std::iterator_traits<RndIter>::difference_type len,
+    RndIter start)
+{
+    using difference_type = typename std::iterator_traits<RndIter>::difference_type;
+    using value_type = typename std::iterator_traits<RndIter>::value_type;
+
+    // left-child index of i is 2*i + 1, right-child is 2*i + 2
+    difference_type child = start - first;
+
+    if (len < 2 || (len - 2) / 2 < child) {
+        return;
+    }
+
+    child = 2 * child + 1;
+    RndIter child_i = first + child;
+
+    if ((child + 1) < len && pred(*child_i, *(child_i + 1))) {
+        ++child_i;
+        ++child;
+    }
+
+    if (pred(*child_i, *start)) {
+        return;
+    }
+
+    value_type top = *start;
+    do {
+        *start = *child_i;
+        start = child_i;
+
+        if ((len - 2) / 2 < child) {
+            break;
+        }
+
+        child = 2 * child + 1;
+        child_i = first + child;
+
+        if ((child + 1) < len && pred(*child_i, *(child_i + 1))) {
+            ++child_i;
+            ++child;
+        }
+    } while (!pred(*child_i, top));
+
+    *start = top;
+}
+
+template <typename RndIter, typename Pred>
+inline void sift_down_range(
+    RndIter first,
+    RndIter last,
+    const Pred& pred,
+    typename std::iterator_traits<RndIter>::difference_type len,
+    RndIter start,
+    std::size_t count)
+{
+    // Apply sift_down to [start, start - count + 1]
+    using difference_type = typename std::iterator_traits<RndIter>::difference_type;
+    for (std::size_t i = 0; i < count; ++i) {
+        sift_down<RndIter>(first, last, pred, len, start - static_cast<difference_type>(i));
+    }
+}
+```

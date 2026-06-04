@@ -1,0 +1,20 @@
+{
+  "iteration": 1,
+  "input_tokens": 64283,
+  "output_tokens": 123969,
+  "request_count": 10,
+  "generation_time_s": 2238.852,
+  "build_status": false,
+  "run_status": false,
+  "overall_status": "BUILD_FAIL",
+  "per_file_status": {
+    "heaps.txt": "BUILD_FAIL"
+  },
+  "build_dictionary": {
+    "build_returncode": 1,
+    "build_stdout": "-- Configuring incomplete, errors occurred!\n",
+    "build_stderr": "CMake Error at CMakeLists.txt:1 (cmake_minimum_required):\n  Compatibility with CMake < 3.5 has been removed from CMake.\n\n  Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax\n  to tell CMake that the project requires at least <min> but has been updated\n  to work with policies introduced by <max> or earlier.\n\n  Or, add -DCMAKE_POLICY_VERSION_MINIMUM=3.5 to try configuring anyway.\n\n\n"
+  },
+  "run_dictionary": null,
+  "output_files_content": {}
+}

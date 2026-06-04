@@ -1,0 +1,271 @@
+// heaps.cpp — Legion translation
+#include "legion.h"
+#include <iostream>
+#include <algorithm>
+#include <vector>
+#include <numeric>
+#include <fstream>
+#include <cmath>
+#include <cstring>
+#include <cassert>
+
+#include "sift.hpp"
+
+using namespace Legion;
+
+enum {
+    TOP_LEVEL_TASK_ID,
+    SIFT_DOWN_RANGE_TASK_ID,
+};
+
+enum {
+    FID_VAL,
+};
+
+struct SiftDownRangeArgs {
+    long long n;
+    long long start_idx;
+    long long count;
+};
+
+// ----------------------------------------------------------------
+// Leaf task: sift-down a contiguous range of heap nodes.
+// Uses a raw pointer obtained from an AffineAccessor so that the
+// original iterator-based sift.hpp code works unchanged.
+// ----------------------------------------------------------------
+void sift_down_range_task(const Task *task,
+                          const std::vector<PhysicalRegion> &regions,
+                          Context ctx, Runtime *runtime)
+{
+    // For index launches the per-point payload is in local_args;
+    // for single-task launches it is in args.
+    SiftDownRangeArgs a;
+    if (task->local_arglen == sizeof(SiftDownRangeArgs))
+        a = *(const SiftDownRangeArgs *)task->local_args;
+    else {
+        assert(task->arglen == sizeof(SiftDownRangeArgs));
+        a = *(const SiftDownRangeArgs *)task->args;
+    }
+
+    const FieldAccessor<READ_WRITE, int, 1, coord_t,
+        Realm::AffineAccessor<int, 1, coord_t>> acc(regions[0], FID_VAL);
+
+    int *first = acc.ptr(Point<1>(0));
+
+    sift_down_range(first, static_cast<int64_t>(a.n),
+                    static_cast<int64_t>(a.start_idx),
+                    static_cast<int64_t>(a.count),
+                    std::less<int>());
+}
+
+// ----------------------------------------------------------------
+// Write heap diagnostics (mirrors the original HPX version)
+// ----------------------------------------------------------------
+void write_heap_characteristics(const std::vector<int> &v)
+{
+    std::ofstream outFile("heaps.txt");
+
+    std::size_t print_count = std::min(v.size(), std::size_t(10));
+    outFile << "First " << print_count << " elements: ";
+    for (std::size_t i = 0; i < print_count; ++i) {
+        outFile << v[i];
+        if (i < print_count - 1) outFile << " ";
+    }
+    outFile << "\n";
+
+    outFile << "Last " << print_count << " elements: ";
+    for (std::size_t i = v.size() - print_count; i < v.size(); ++i) {
+        outFile << v[i];
+        if (i < v.size() - 1) outFile << " ";
+    }
+    outFile << "\n";
+
+    long long sum = std::accumulate(v.begin(), v.end(), 0LL);
+    outFile << "Sum of all elements: " << sum << "\n";
+
+    if (!v.empty())
+        outFile << "Root (max) element: " << v[0] << "\n";
+
+    bool is_valid_heap = std::is_heap(v.begin(), v.end());
+    outFile << "Is valid heap: " << (is_valid_heap ? "true" : "false") << "\n";
+    outFile.close();
+}
+
+// ----------------------------------------------------------------
+// Top-level task – orchestrates the whole programme
+// ----------------------------------------------------------------
+void top_level_task(const Task *task,
+                    const std::vector<PhysicalRegion> &regions,
+                    Context ctx, Runtime *runtime)
+{
+    // --- Parse command-line arguments --------------------------------
+    std::size_t vector_size = 25;
+    std::size_t chunk_size  = 0;
+    {
+        const InputArgs &cli = Runtime::get_input_args();
+        for (int i = 1; i < cli.argc; ++i) {
+            if (!strcmp(cli.argv[i], "--vector_size") && i + 1 < cli.argc)
+                vector_size = std::stoul(cli.argv[++i]);
+            else if (!strcmp(cli.argv[i], "--chunk_size") && i + 1 < cli.argc)
+                chunk_size = std::stoul(cli.argv[++i]);
+        }
+    }
+
+    if (chunk_size == 0) {
+        Machine::ProcessorQuery pq(Machine::get_machine());
+        pq.only_kind(Processor::LOC_PROC);
+        std::size_t threads = pq.count();
+        if (threads == 0) threads = 1;
+        chunk_size = vector_size / threads;
+        if (chunk_size == 0) chunk_size = 1;
+    }
+
+    // --- Create logical region for the array -------------------------
+    IndexSpaceT<1> is =
+        runtime->create_index_space(ctx, Rect<1>(0, (coord_t)vector_size - 1));
+    FieldSpace fs = runtime->create_field_space(ctx);
+    {
+        FieldAllocator fa = runtime->create_field_allocator(ctx, fs);
+        fa.allocate_field(sizeof(int), FID_VAL);
+    }
+    LogicalRegion lr = runtime->create_logical_region(ctx, is, fs);
+
+    // --- Fill the region with 0, 1, 2, …, vector_size-1 -------------
+    {
+        RegionRequirement req(lr, WRITE_DISCARD, EXCLUSIVE, lr);
+        req.add_field(FID_VAL);
+        InlineLauncher il(req);
+        PhysicalRegion pr = runtime->map_region(ctx, il);
+        pr.wait_until_valid();
+        const FieldAccessor<WRITE_DISCARD, int, 1, coord_t,
+            Realm::AffineAccessor<int, 1, coord_t>> acc(pr, FID_VAL);
+        for (std::size_t i = 0; i < vector_size; ++i)
+            acc[i] = static_cast<int>(i);
+        runtime->unmap_region(ctx, pr);
+    }
+
+    // --- Level-parallel bottom-up heap construction ------------------
+    long long n = static_cast<long long>(vector_size);
+
+    if (n > 1) {
+        for (long long start = (n - 2) / 2; start > 0;
+             start = static_cast<long long>(
+                         std::pow(2, static_cast<long long>(
+                                         std::log2(static_cast<double>(start))))) - 2)
+        {
+            long long end_level = static_cast<long long>(
+                std::pow(2, static_cast<long long>(
+                                std::log2(static_cast<double>(start))))) - 2;
+
+            std::size_t items = static_cast<std::size_t>(start - end_level);
+
+            std::size_t cs = chunk_size;
+            if (cs > items) cs = items / 2;
+            if (cs == 0)    cs = 1;
+
+            // Build per-chunk argument list
+            std::vector<SiftDownRangeArgs> chunk_args;
+            std::size_t cnt = 0;
+            while (cnt + cs < items) {
+                chunk_args.push_back(
+                    {n, start - static_cast<long long>(cnt),
+                     static_cast<long long>(cs)});
+                cnt += cs;
+            }
+            if (cnt < items)
+                chunk_args.push_back(
+                    {n, start - static_cast<long long>(cnt),
+                     static_cast<long long>(items - cnt)});
+
+            std::size_t num_chunks = chunk_args.size();
+
+            if (num_chunks == 1) {
+                // Single task – EXCLUSIVE is fine
+                TaskLauncher launcher(SIFT_DOWN_RANGE_TASK_ID,
+                    TaskArgument(&chunk_args[0], sizeof(SiftDownRangeArgs)));
+                launcher.add_region_requirement(
+                    RegionRequirement(lr, READ_WRITE, EXCLUSIVE, lr));
+                launcher.region_requirements[0].add_field(FID_VAL);
+                runtime->execute_task(ctx, launcher).get_void_result();
+            } else {
+                // Index launch – SIMULTANEOUS lets all point tasks in
+                // the same launch share the physical instance (they
+                // operate on disjoint subtrees, so no data race).
+                Rect<1> launch_bounds(0, static_cast<coord_t>(num_chunks) - 1);
+                IndexSpaceT<1> launch_is =
+                    runtime->create_index_space(ctx, launch_bounds);
+
+                ArgumentMap arg_map;
+                for (std::size_t i = 0; i < num_chunks; ++i)
+                    arg_map.set_point(
+                        DomainPoint(Point<1>(static_cast<coord_t>(i))),
+                        TaskArgument(&chunk_args[i], sizeof(SiftDownRangeArgs)));
+
+                IndexTaskLauncher idx(SIFT_DOWN_RANGE_TASK_ID,
+                                      launch_is,
+                                      TaskArgument(NULL, 0),
+                                      arg_map);
+                idx.add_region_requirement(
+                    RegionRequirement(lr, READ_WRITE, SIMULTANEOUS, lr));
+                idx.region_requirements[0].add_field(FID_VAL);
+
+                FutureMap fm = runtime->execute_index_space(ctx, idx);
+                fm.wait_all_results();          // level barrier
+
+                runtime->destroy_index_space(ctx, launch_is);
+            }
+        }
+
+        // Sift down the root node
+        SiftDownRangeArgs root_args = {n, 0LL, 1LL};
+        TaskLauncher root_launcher(SIFT_DOWN_RANGE_TASK_ID,
+            TaskArgument(&root_args, sizeof(SiftDownRangeArgs)));
+        root_launcher.add_region_requirement(
+            RegionRequirement(lr, READ_WRITE, EXCLUSIVE, lr));
+        root_launcher.region_requirements[0].add_field(FID_VAL);
+        runtime->execute_task(ctx, root_launcher).get_void_result();
+    }
+
+    // --- Read back and write diagnostics -----------------------------
+    {
+        RegionRequirement req(lr, READ_ONLY, EXCLUSIVE, lr);
+        req.add_field(FID_VAL);
+        InlineLauncher il(req);
+        PhysicalRegion pr = runtime->map_region(ctx, il);
+        pr.wait_until_valid();
+        const FieldAccessor<READ_ONLY, int, 1, coord_t,
+            Realm::AffineAccessor<int, 1, coord_t>> acc(pr, FID_VAL);
+
+        std::vector<int> v(vector_size);
+        for (std::size_t i = 0; i < vector_size; ++i)
+            v[i] = acc[i];
+        runtime->unmap_region(ctx, pr);
+
+        write_heap_characteristics(v);
+    }
+
+    // --- Cleanup -----------------------------------------------------
+    runtime->destroy_logical_region(ctx, lr);
+    runtime->destroy_field_space(ctx, fs);
+    runtime->destroy_index_space(ctx, is);
+}
+
+// ----------------------------------------------------------------
+int main(int argc, char **argv)
+{
+    Runtime::set_top_level_task_id(TOP_LEVEL_TASK_ID);
+
+    {
+        TaskVariantRegistrar reg(TOP_LEVEL_TASK_ID, "top_level");
+        reg.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        Runtime::preregister_task_variant<top_level_task>(reg, "top_level");
+    }
+    {
+        TaskVariantRegistrar reg(SIFT_DOWN_RANGE_TASK_ID, "sift_down_range");
+        reg.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+        reg.set_leaf(true);
+        Runtime::preregister_task_variant<sift_down_range_task>(reg, "sift_down_range");
+    }
+
+    return Runtime::start(argc, argv);
+}

@@ -1,0 +1,66 @@
+{
+  "iteration": 1,
+  "input_tokens": 6593,
+  "output_tokens": 13890,
+  "request_count": 1,
+  "generation_time_s": 268.193,
+  "build_status": true,
+  "run_status": true,
+  "overall_status": "PASS",
+  "per_file_status": {
+    "heaps.txt": "PASS"
+  },
+  "build_dictionary": {
+    "build_returncode": 0,
+    "build_stdout": "-- The CXX compiler identification is GNU 14.3.0\n-- Detecting CXX compiler ABI info\n-- Detecting CXX compiler ABI info - done\n-- Check for working CXX compiler: /gridapps/software/GCCcore/14.3.0/bin/c++ - skipped\n-- Detecting CXX compile features\n-- Detecting CXX compile features - done\n-- Using Legion_DIR from environment: /Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/share/Legion/cmake\n-- Found ZLIB: /gridapps/software/zlib/1.3.1-GCCcore-14.3.0/lib/libz.so (found version \"1.3.1\")\n-- Found Legion: /Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/share/Legion/cmake\n-- Found Boost: /Users/robsonlab/Teetly/hpx/boost_1_64_0/install/include\n-- Configuring done (1.1s)\n-- Generating done (0.0s)\n-- Build files have been written to: /tmp/tmpoaecpiz6/build\n[ 50%] Building CXX object CMakeFiles/heaps.dir/heaps.cpp.o\n[100%] Linking CXX executable heaps\n[100%] Built target heaps\n",
+    "build_stderr": "CMake Warning (dev) at CMakeLists.txt:14 (find_package):\n  Policy CMP0144 is not set: find_package uses upper-case <PACKAGENAME>_ROOT\n  variables.  Run \"cmake --help-policy CMP0144\" for policy details.  Use the\n  cmake_policy command to set the policy and suppress this warning.\n\n  Environment variable LEGION_ROOT is set to:\n\n    /Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid\n\n  For compatibility, find_package is ignoring the variable, but code in a\n  .cmake module might still use it.\nThis warning is for project developers.  Use -Wno-dev to suppress it.\n\nCMake Warning (dev) at CMakeLists.txt:21 (find_package):\n  Policy CMP0144 is not set: find_package uses upper-case <PACKAGENAME>_ROOT\n  variables.  Run \"cmake --help-policy CMP0144\" for policy details.  Use the\n  cmake_policy command to set the policy and suppress this warning.\n\n  CMake variable BOOST_ROOT is set to:\n\n    /Users/robsonlab/Teetly/hpx/boost_1_64_0/install\n\n  Environment variable BOOST_ROOT is set to:\n\n    /Users/robsonlab/Teetly/hpx/boost_1_64_0/install\n\n  For compatibility, find_package is ignoring the variable, but code in a\n  .cmake module might still use it.\nThis warning is for project developers.  Use -Wno-dev to suppress it.\n\nCMake Warning (dev) at CMakeLists.txt:21 (find_package):\n  Policy CMP0167 is not set: The FindBoost module is removed.  Run \"cmake\n  --help-policy CMP0167\" for policy details.  Use the cmake_policy command to\n  set the policy and suppress this warning.\n\nThis warning is for project developers.  Use -Wno-dev to suppress it.\n\n"
+  },
+  "run_dictionary": {
+    "run_returncodes": [
+      0
+    ],
+    "run_stdouts": [
+      ""
+    ],
+    "run_stderrs": [
+      ""
+    ],
+    "runtime": 1.293,
+    "per_command_runtimes": [
+      1.292
+    ]
+  },
+  "output_files_content": {
+    "heaps.txt": "First 10 elements: 2409865 2409864 2097150 2409863 1572862 1835006 2097149 2359294 2409862 1441790\nLast 10 elements: 587 293 2352 146 9412 4705 301231 301232 150615 75307\nSum of all elements: 2903725864045\nRoot (max) element: 2409865\nIs valid heap: true\n"
+  },
+  "scaling": {
+    "processors": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32,
+      64
+    ],
+    "runtimes": [
+      1.301,
+      1.421,
+      1.76,
+      1.534,
+      1.942,
+      1.684,
+      1.764
+    ],
+    "returncodes": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "success": true
+  }
+}

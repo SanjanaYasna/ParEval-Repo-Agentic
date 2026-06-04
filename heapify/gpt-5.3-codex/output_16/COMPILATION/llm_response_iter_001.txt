@@ -1,0 +1,599 @@
+[CMakeLists.txt]
+```cmake
+cmake_minimum_required(VERSION 3.14 FATAL_ERROR)
+
+project(heaps LANGUAGES CXX)
+
+# Respect Legion_DIR from environment if provided
+if(DEFINED ENV{Legion_DIR} AND NOT Legion_DIR)
+  set(Legion_DIR "$ENV{Legion_DIR}")
+  message(STATUS "Using Legion_DIR from environment: $ENV{Legion_DIR}")
+endif()
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+# Legion (CONFIG mode; assumes Legion_DIR points to LegionConfig.cmake location)
+find_package(Legion CONFIG REQUIRED)
+
+# Boost (for program_options)
+find_package(Boost REQUIRED COMPONENTS program_options)
+
+add_executable(heaps
+  heaps.cpp
+  sift.hpp
+)
+
+target_include_directories(heaps PRIVATE ${Boost_INCLUDE_DIRS})
+target_link_libraries(heaps PRIVATE ${Boost_LIBRARIES})
+
+# Handle common Legion package target/variable variants
+if(TARGET Legion::Legion)
+  target_link_libraries(heaps PRIVATE Legion::Legion)
+elseif(TARGET Legion)
+  target_link_libraries(heaps PRIVATE Legion)
+elseif(DEFINED Legion_LIBRARIES OR DEFINED LEGION_LIBRARIES)
+  target_include_directories(heaps PRIVATE
+    ${Legion_INCLUDE_DIRS}
+    ${LEGION_INCLUDE_DIRS}
+  )
+  target_link_libraries(heaps PRIVATE
+    ${Legion_LIBRARIES}
+    ${LEGION_LIBRARIES}
+  )
+else()
+  message(FATAL_ERROR "Legion found, but no known Legion target/library variables were exported.")
+endif()
+
+target_compile_options(heaps PRIVATE -O3 -w)
+```
+
+[ReadMe.md]
+```markdown
+WIP (Work-in-progress) level parallelism based algorithm for the implementation of `make_heap`
+within Legion parallel algorithms library. The goal of this prototype is to experiment with a *bottom‑up, level‑parallel* heap
+construction strategy using futures and to explore how chunking
+and synchronization between tree levels work. All benchmark results are written to `heaps.txt`. The compiled program executable should be called ```heaps```.
+
+### Prerequisites
+
+- Legion installed
+- A C++17-compliant C++ compiler (e.g. GCC, Clang) and beyond
+- Boost, which path is set as `BOOST_ROOT` and incorporated into `LD_LIBRARY_PATH`
+
+
+### Build
+
+Repository depends on Legion 25.06.0
+
+Make sure to set $LEGION_ROOT to Legion install directory 
+
+```
+mkdir build; cd build
+
+cmake ..
+
+make
+```
+
+### Run
+-----------------
+The heaps benchmark is controlled by two command-line options:
+
+--vector_size (int)
+Number of elements in the input vector. The vector is initialized as
+0, 1, 2, ..., vector_size - 1.
+
+--chunk_size (int)
+Number of heap nodes processed per task at each tree level.
+If chunk_size > 0, it directly controls the per-task work size.
+If chunk_size == 0 (default), it is chosen automatically as
+vector_size / (number of worker threads).
+
+Example Run: 
+```bash
+> ./heaps --vector_size 999999 --chunk_size 1000
+> cat heaps.txt
+First 10 elements: 999998 786430 999997 655358 786429 917502 999996 589822 655357 720894
+Last 10 elements: 60 124997 3905 1952 975 7811 487 31248 15623 124998
+Sum of all elements: 499998500001
+Root (max) element: 999998
+Is valid heap: true
+```
+
+
+
+```
+
+[heaps.cpp]
+```cpp
+#include "legion.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <fstream>
+#include <iostream>
+#include <numeric>
+#include <string>
+#include <thread>
+#include <vector>
+
+using namespace Legion;
+
+enum TaskIDs {
+  TOP_LEVEL_TASK_ID = 1,
+  SIFT_CHUNK_TASK_ID = 2
+};
+
+enum FieldIDs {
+  FID_VALUE = 1
+};
+
+struct LevelTaskArgs {
+  int64_t n;
+  int64_t level_start;  // rightmost node index of the current level
+  int64_t items;        // number of nodes in this level
+  int64_t chunk_size;   // nodes per task
+};
+
+template <typename Accessor>
+static inline void sift_down_accessor(Accessor &acc, int64_t len, int64_t start_idx) {
+  int64_t child = start_idx;
+
+  if (len < 2 || ((len - 2) / 2) < child) return;
+
+  child = 2 * child + 1;
+
+  if ((child + 1) < len &&
+      acc[Point<1>(static_cast<coord_t>(child))] <
+          acc[Point<1>(static_cast<coord_t>(child + 1))]) {
+    ++child;
+  }
+
+  if (acc[Point<1>(static_cast<coord_t>(child))] <
+      acc[Point<1>(static_cast<coord_t>(start_idx))]) {
+    return;
+  }
+
+  int top = acc[Point<1>(static_cast<coord_t>(start_idx))];
+  int64_t hole = start_idx;
+
+  do {
+    acc[Point<1>(static_cast<coord_t>(hole))] =
+        acc[Point<1>(static_cast<coord_t>(child))];
+    hole = child;
+
+    if (((len - 2) / 2) < child) break;
+
+    child = 2 * child + 1;
+
+    if ((child + 1) < len &&
+        acc[Point<1>(static_cast<coord_t>(child))] <
+            acc[Point<1>(static_cast<coord_t>(child + 1))]) {
+      ++child;
+    }
+  } while (!(acc[Point<1>(static_cast<coord_t>(child))] < top));
+
+  acc[Point<1>(static_cast<coord_t>(hole))] = top;
+}
+
+static inline int64_t floor_log2_u64(uint64_t x) {
+  int64_t l = -1;
+  while (x) {
+    x >>= 1;
+    ++l;
+  }
+  return l;
+}
+
+static void write_heap_characteristics(const std::vector<int> &v) {
+  std::ofstream outFile("heaps.txt");
+
+  const std::size_t print_count = std::min<std::size_t>(10, v.size());
+
+  outFile << "First " << print_count << " elements: ";
+  for (std::size_t i = 0; i < print_count; ++i) {
+    outFile << v[i];
+    if (i + 1 < print_count) outFile << " ";
+  }
+
+  outFile << "\n";
+  outFile << "Last " << print_count << " elements: ";
+  const std::size_t start_last = (v.size() > print_count) ? (v.size() - print_count) : 0;
+  for (std::size_t i = start_last; i < v.size(); ++i) {
+    outFile << v[i];
+    if (i + 1 < v.size()) outFile << " ";
+  }
+
+  outFile << "\n";
+  long long sum = std::accumulate(v.begin(), v.end(), 0LL);
+  outFile << "Sum of all elements: " << sum << "\n";
+
+  if (!v.empty()) {
+    outFile << "Root (max) element: " << v[0] << "\n";
+  }
+
+  bool is_valid_heap = std::is_heap(v.begin(), v.end());
+  outFile << "Is valid heap: " << (is_valid_heap ? "true" : "false") << "\n";
+}
+
+void sift_chunk_task(const Task *task,
+                     const std::vector<PhysicalRegion> &regions,
+                     Context /*ctx*/,
+                     Runtime * /*runtime*/) {
+  const auto *args = static_cast<const LevelTaskArgs *>(task->args);
+  const int64_t task_idx = static_cast<int64_t>(task->index_point[0]);
+
+  const int64_t offset = task_idx * args->chunk_size;
+  if (offset >= args->items) return;
+
+  const int64_t count = std::min<int64_t>(args->chunk_size, args->items - offset);
+  const int64_t start_idx = args->level_start - offset;
+
+  FieldAccessor<READ_WRITE, int, 1> acc(regions[0], FID_VALUE);
+
+  for (int64_t i = 0; i < count; ++i) {
+    sift_down_accessor(acc, args->n, start_idx - i);
+  }
+}
+
+static void parse_command_line(const InputArgs &in_args,
+                               std::size_t &vector_size,
+                               std::size_t &chunk_size,
+                               bool &help) {
+  vector_size = 25;
+  chunk_size = 0;
+  help = false;
+
+  for (int i = 1; i < in_args.argc; ++i) {
+    std::string a(in_args.argv[i]);
+
+    if (a == "--help" || a == "-h") {
+      help = true;
+      continue;
+    }
+
+    if (a == "--vector_size" && i + 1 < in_args.argc) {
+      vector_size = static_cast<std::size_t>(std::stoull(in_args.argv[++i]));
+      continue;
+    }
+    if (a.rfind("--vector_size=", 0) == 0) {
+      vector_size = static_cast<std::size_t>(std::stoull(a.substr(14)));
+      continue;
+    }
+
+    if (a == "--chunk_size" && i + 1 < in_args.argc) {
+      chunk_size = static_cast<std::size_t>(std::stoull(in_args.argv[++i]));
+      continue;
+    }
+    if (a.rfind("--chunk_size=", 0) == 0) {
+      chunk_size = static_cast<std::size_t>(std::stoull(a.substr(13)));
+      continue;
+    }
+  }
+}
+
+void top_level_task(const Task * /*task*/,
+                    const std::vector<PhysicalRegion> & /*regions*/,
+                    Context ctx,
+                    Runtime *runtime) {
+  std::size_t vector_size = 25;
+  std::size_t chunk_size = 0;
+  bool help = false;
+
+  parse_command_line(Runtime::get_input_args(), vector_size, chunk_size, help);
+
+  if (help) {
+    std::cout << "Usage: ./heaps [--vector_size N] [--chunk_size C] [Legion runtime options]\n";
+    std::cout << "Example: ./heaps --vector_size 999 --chunk_size 100\n";
+    return;
+  }
+
+  if (chunk_size == 0) {
+    unsigned threads = std::thread::hardware_concurrency();
+    if (threads == 0) threads = 1;
+    chunk_size = vector_size / threads;
+    if (chunk_size == 0) chunk_size = 1;
+  }
+
+  if (vector_size == 0) {
+    write_heap_characteristics(std::vector<int>{});
+    return;
+  }
+
+  // Create 1D region storing the array.
+  Rect<1> elem_rect(Point<1>(0), Point<1>(static_cast<coord_t>(vector_size - 1)));
+  IndexSpace is = runtime->create_index_space(ctx, elem_rect);
+
+  FieldSpace fs = runtime->create_field_space(ctx);
+  {
+    FieldAllocator allocator = runtime->create_field_allocator(ctx, fs);
+    allocator.allocate_field(sizeof(int), FID_VALUE);
+  }
+
+  LogicalRegion lr = runtime->create_logical_region(ctx, is, fs);
+
+  // Initialize v[i] = i.
+  {
+    RegionRequirement req(lr, WRITE_DISCARD, EXCLUSIVE, lr);
+    req.add_field(FID_VALUE);
+    InlineLauncher launcher(req);
+    PhysicalRegion pr = runtime->map_region(ctx, launcher);
+    pr.wait_until_valid();
+
+    FieldAccessor<WRITE_DISCARD, int, 1> acc(pr, FID_VALUE);
+    for (std::size_t i = 0; i < vector_size; ++i) {
+      acc[Point<1>(static_cast<coord_t>(i))] = static_cast<int>(i);
+    }
+
+    runtime->unmap_region(ctx, pr);
+  }
+
+  // Bottom-up, level-parallel heap construction.
+  const int64_t n = static_cast<int64_t>(vector_size);
+  if (n > 1) {
+    const int64_t max_parent = (n - 2) / 2;
+    const int64_t deepest_internal_level = floor_log2_u64(static_cast<uint64_t>(max_parent + 1));
+
+    for (int64_t level = deepest_internal_level; level >= 1; --level) {
+      const int64_t level_left = (1LL << level) - 1;
+      const int64_t level_right = std::min<int64_t>((1LL << (level + 1)) - 2, max_parent);
+      const int64_t items = level_right - level_left + 1;
+      if (items <= 0) continue;
+
+      int64_t effective_chunk = static_cast<int64_t>(chunk_size);
+      if (effective_chunk <= 0) effective_chunk = 1;
+      if (effective_chunk > items) effective_chunk = items;
+
+      const int64_t num_tasks = (items + effective_chunk - 1) / effective_chunk;
+
+      LevelTaskArgs args{n, level_right, items, effective_chunk};
+
+      Domain launch_domain(Rect<1>(
+          Point<1>(0), Point<1>(static_cast<coord_t>(num_tasks - 1))));
+      ArgumentMap arg_map;
+
+      IndexLauncher launcher(
+          SIFT_CHUNK_TASK_ID, launch_domain, TaskArgument(&args, sizeof(args)), arg_map);
+
+      RegionRequirement rr(lr, READ_WRITE, SIMULTANEOUS, lr);
+      rr.add_field(FID_VALUE);
+      launcher.add_region_requirement(rr);
+
+      FutureMap fm = runtime->execute_index_space(ctx, launcher);
+      fm.wait_all_results();
+    }
+
+    // Root sift-down
+    RegionRequirement req(lr, READ_WRITE, EXCLUSIVE, lr);
+    req.add_field(FID_VALUE);
+    InlineLauncher launcher(req);
+    PhysicalRegion pr = runtime->map_region(ctx, launcher);
+    pr.wait_until_valid();
+
+    FieldAccessor<READ_WRITE, int, 1> acc(pr, FID_VALUE);
+    sift_down_accessor(acc, n, 0);
+
+    // Snapshot for output checks.
+    std::vector<int> v(vector_size);
+    for (std::size_t i = 0; i < vector_size; ++i) {
+      v[i] = acc[Point<1>(static_cast<coord_t>(i))];
+    }
+
+    runtime->unmap_region(ctx, pr);
+
+    write_heap_characteristics(v);
+  } else {
+    // n == 1
+    RegionRequirement req(lr, READ_ONLY, EXCLUSIVE, lr);
+    req.add_field(FID_VALUE);
+    InlineLauncher launcher(req);
+    PhysicalRegion pr = runtime->map_region(ctx, launcher);
+    pr.wait_until_valid();
+
+    FieldAccessor<READ_ONLY, int, 1> acc(pr, FID_VALUE);
+    std::vector<int> v(1);
+    v[0] = acc[Point<1>(0)];
+
+    runtime->unmap_region(ctx, pr);
+    write_heap_characteristics(v);
+  }
+
+  runtime->destroy_logical_region(ctx, lr);
+  runtime->destroy_field_space(ctx, fs);
+  runtime->destroy_index_space(ctx, is);
+}
+
+int main(int argc, char **argv) {
+  Runtime::set_top_level_task_id(TOP_LEVEL_TASK_ID);
+
+  {
+    TaskVariantRegistrar registrar(TOP_LEVEL_TASK_ID, "top_level_task");
+    registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+    Runtime::preregister_task_variant<top_level_task>(registrar, "top_level_task");
+  }
+
+  {
+    TaskVariantRegistrar registrar(SIFT_CHUNK_TASK_ID, "sift_chunk_task");
+    registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+    registrar.set_leaf();
+    Runtime::preregister_task_variant<sift_chunk_task>(registrar, "sift_chunk_task");
+  }
+
+  return Runtime::start(argc, argv);
+}
+```
+
+[sift.hpp]
+```cpp
+#pragma once
+
+#include <legion.h>
+
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <iterator>
+#include <utility>
+
+// ------------------------------------------------------------
+// Generic (sequential) sift helpers (kept close to original)
+// ------------------------------------------------------------
+template <typename RndIter, typename Pred>
+inline void sift_down(
+    RndIter first, RndIter /*last*/, const Pred& pred,
+    typename std::iterator_traits<RndIter>::difference_type len,
+    RndIter start)
+{
+  using difference_type = typename std::iterator_traits<RndIter>::difference_type;
+  using value_type = typename std::iterator_traits<RndIter>::value_type;
+
+  difference_type child = start - first;
+
+  if (len < 2 || (len - 2) / 2 < child)
+    return;
+
+  child = 2 * child + 1;
+  RndIter child_i = first + child;
+
+  if ((child + 1) < len && pred(*child_i, *(child_i + 1))) {
+    ++child_i;
+    ++child;
+  }
+
+  if (pred(*child_i, *start))
+    return;
+
+  value_type top = *start;
+  do {
+    *start = *child_i;
+    start = child_i;
+
+    if ((len - 2) / 2 < child)
+      break;
+
+    child = 2 * child + 1;
+    child_i = first + child;
+
+    if ((child + 1) < len && pred(*child_i, *(child_i + 1))) {
+      ++child_i;
+      ++child;
+    }
+  } while (!pred(*child_i, top));
+
+  *start = top;
+}
+
+template <typename RndIter, typename Pred>
+inline void sift_down_range(
+    RndIter first, RndIter last, const Pred& pred,
+    typename std::iterator_traits<RndIter>::difference_type len,
+    RndIter start, std::size_t count)
+{
+  using difference_type = typename std::iterator_traits<RndIter>::difference_type;
+  for (std::size_t i = 0; i < count; ++i) {
+    sift_down(first, last, pred, len, start - static_cast<difference_type>(i));
+  }
+}
+
+// ------------------------------------------------------------
+// Legion task kernel for range-based sift-down over int field
+// ------------------------------------------------------------
+//
+// Expected launch shape:
+// - 1 region requirement (READ_WRITE) for heap data field
+// - task args = SiftDownRangeTaskArgs
+//
+struct SiftDownRangeTaskArgs {
+  std::int64_t len;       // total heap length
+  std::int64_t start;     // starting node index (0-based)
+  std::int64_t count;     // number of nodes to process backward from start
+  Legion::FieldID fid;    // field containing int heap values
+};
+
+inline int heap_get(
+    const Legion::FieldAccessor<Legion::READ_WRITE, int, 1>& acc,
+    Legion::coord_t base, std::int64_t idx)
+{
+  return acc[Legion::Point<1>(base + idx)];
+}
+
+inline void heap_set(
+    const Legion::FieldAccessor<Legion::READ_WRITE, int, 1>& acc,
+    Legion::coord_t base, std::int64_t idx, int value)
+{
+  acc[Legion::Point<1>(base + idx)] = value;
+}
+
+inline void sift_down_accessor(
+    const Legion::FieldAccessor<Legion::READ_WRITE, int, 1>& acc,
+    Legion::coord_t base, std::int64_t len, std::int64_t start)
+{
+  if (start < 0)
+    return;
+
+  std::int64_t child = start;
+  if (len < 2 || (len - 2) / 2 < child)
+    return;
+
+  child = 2 * child + 1;
+
+  if ((child + 1) < len && heap_get(acc, base, child) < heap_get(acc, base, child + 1)) {
+    ++child;
+  }
+
+  if (heap_get(acc, base, child) < heap_get(acc, base, start))
+    return;
+
+  int top = heap_get(acc, base, start);
+  std::int64_t cur = start;
+
+  do {
+    heap_set(acc, base, cur, heap_get(acc, base, child));
+    cur = child;
+
+    if ((len - 2) / 2 < child)
+      break;
+
+    child = 2 * child + 1;
+    if ((child + 1) < len && heap_get(acc, base, child) < heap_get(acc, base, child + 1)) {
+      ++child;
+    }
+  } while (!(heap_get(acc, base, child) < top));
+
+  heap_set(acc, base, cur, top);
+}
+
+inline void sift_down_range_task(
+    const Legion::Task* task,
+    const std::vector<Legion::PhysicalRegion>& regions,
+    Legion::Context ctx,
+    Legion::Runtime* runtime)
+{
+  assert(task != nullptr);
+  assert(task->arglen == sizeof(SiftDownRangeTaskArgs));
+  assert(regions.size() == 1);
+
+  const auto* args = static_cast<const SiftDownRangeTaskArgs*>(task->args);
+
+  const Legion::FieldAccessor<Legion::READ_WRITE, int, 1> acc(regions[0], args->fid);
+
+  const Legion::Domain dom =
+      runtime->get_index_space_domain(ctx, task->regions[0].region.get_index_space());
+  const Legion::Rect<1> rect = dom.get_rect<1>();
+  const Legion::coord_t base = rect.lo[0];
+
+  for (std::int64_t i = 0; i < args->count; ++i) {
+    const std::int64_t node = args->start - i;
+    if (node < 0)
+      break;
+    sift_down_accessor(acc, base, args->len, node);
+  }
+}
+```

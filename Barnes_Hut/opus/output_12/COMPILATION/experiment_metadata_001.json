@@ -1,0 +1,20 @@
+{
+  "iteration": 1,
+  "input_tokens": 59480,
+  "output_tokens": 114837,
+  "request_count": 5,
+  "generation_time_s": 1913.24,
+  "build_status": false,
+  "run_status": false,
+  "overall_status": "BUILD_FAIL",
+  "per_file_status": {
+    "barnes_hut.txt": "BUILD_FAIL"
+  },
+  "build_dictionary": {
+    "build_returncode": 2,
+    "build_stdout": "c++ -O2 -std=c++17 -Wall  -o barnes-hut main.cpp -lm \n",
+    "build_stderr": "Package hpx_application was not found in the pkg-config search path.\nPerhaps you should add the directory containing `hpx_application.pc'\nto the PKG_CONFIG_PATH environment variable\nPackage 'hpx_application', required by 'virtual:world', not found\nPackage hpx_application was not found in the pkg-config search path.\nPerhaps you should add the directory containing `hpx_application.pc'\nto the PKG_CONFIG_PATH environment variable\nPackage 'hpx_application', required by 'virtual:world', not found\nmain.cpp:17:10: fatal error: hpx/hpx.hpp: No such file or directory\n   17 | #include <hpx/hpx.hpp>\n      |          ^~~~~~~~~~~~~\ncompilation terminated.\nmake: *** [Makefile:14: all] Error 1\n"
+  },
+  "run_dictionary": null,
+  "output_files_content": {}
+}

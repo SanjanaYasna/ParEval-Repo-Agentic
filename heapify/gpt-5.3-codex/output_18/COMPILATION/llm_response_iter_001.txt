@@ -1,0 +1,450 @@
+[CMakeLists.txt]
+```cmake
+cmake_minimum_required(VERSION 3.14 FATAL_ERROR)
+
+project(heaps LANGUAGES CXX)
+
+# C++ standard
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# Honor Legion_DIR from environment (expected to point to Legion CMake config dir)
+if(DEFINED ENV{Legion_DIR} AND NOT Legion_DIR)
+  set(Legion_DIR "$ENV{Legion_DIR}" CACHE PATH "Path to Legion CMake configuration")
+  message(STATUS "Using Legion_DIR from environment: $ENV{Legion_DIR}")
+endif()
+
+# Dependencies
+find_package(Legion REQUIRED CONFIG)
+find_package(Boost REQUIRED COMPONENTS program_options)
+
+# Executable
+add_executable(heaps
+  heaps.cpp
+  sift.hpp
+)
+
+target_include_directories(heaps PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+# Link Legion target (handle common exported target names + fallback variables)
+if(TARGET Legion::Legion)
+  target_link_libraries(heaps PRIVATE Legion::Legion Boost::program_options)
+elseif(TARGET Legion)
+  target_link_libraries(heaps PRIVATE Legion Boost::program_options)
+else()
+  message(STATUS "Using Legion include/library variables fallback")
+  target_include_directories(heaps PRIVATE ${Legion_INCLUDE_DIRS})
+  target_link_libraries(heaps PRIVATE ${Legion_LIBRARIES} Boost::program_options)
+endif()
+```
+
+[ReadMe.md]
+```markdown
+WIP (Work-in-progress) level parallelism based algorithm for the implementation of `make_heap`
+within Legion parallel algorithms library. The goal of this prototype is to experiment with a *bottom‑up, level‑parallel* heap
+construction strategy using futures and to explore how chunking
+and synchronization between tree levels work. All benchmark results are written to `heaps.txt`. The compiled program executable should be called ```heaps```.
+
+### Prerequisites
+
+- Legion installed
+- A C++17-compliant C++ compiler (e.g. GCC, Clang) and beyond
+- Boost, which path is set as `BOOST_ROOT` and incorporated into `LD_LIBRARY_PATH`
+
+
+### Build
+
+Repository depends on Legion 25.06.0
+
+Make sure to set $LEGION_ROOT to Legion install directory 
+
+```
+mkdir build; cd build
+
+cmake ..
+
+make
+```
+
+### Run
+-----------------
+The heaps benchmark is controlled by two command-line options:
+
+--vector_size (int)
+Number of elements in the input vector. The vector is initialized as
+0, 1, 2, ..., vector_size - 1.
+
+--chunk_size (int)
+Number of heap nodes processed per task at each tree level.
+If chunk_size > 0, it directly controls the per-task work size.
+If chunk_size == 0 (default), it is chosen automatically as
+vector_size / (number of worker threads).
+
+Example Run: 
+```bash
+> ./heaps --vector_size 999999 --chunk_size 1000
+> cat heaps.txt
+First 10 elements: 999998 786430 999997 655358 786429 917502 999996 589822 655357 720894
+Last 10 elements: 60 124997 3905 1952 975 7811 487 31248 15623 124998
+Sum of all elements: 499998500001
+Root (max) element: 999998
+Is valid heap: true
+```
+
+
+
+```
+
+[heaps.cpp]
+```cpp
+#include "legion.h"
+
+#include <algorithm>
+#include <cstddef>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <iterator>
+#include <numeric>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "sift.hpp"
+
+using namespace Legion;
+
+enum TaskIDs : TaskID {
+  TOP_LEVEL_TASK_ID = 1,
+  SIFT_DOWN_CHUNK_TASK_ID,
+};
+
+struct SiftChunkArgs {
+  int* data;
+  std::size_t len;
+  std::size_t start_index;  // right-most parent index in this chunk
+  std::size_t count;        // number of parent nodes to process, moving left
+};
+
+struct ProgramOptions {
+  std::size_t vector_size = 25;
+  std::size_t chunk_size = 0;
+  bool help = false;
+};
+
+static bool parse_size_t(const std::string& s, std::size_t& out) {
+  try {
+    std::size_t pos = 0;
+    unsigned long long v = std::stoull(s, &pos);
+    if (pos != s.size()) return false;
+    out = static_cast<std::size_t>(v);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+static ProgramOptions parse_options(const InputArgs& args) {
+  ProgramOptions opts;
+
+  for (int i = 1; i < args.argc; ++i) {
+    std::string a(args.argv[i]);
+
+    if (a == "--help" || a == "-h") {
+      opts.help = true;
+      continue;
+    }
+
+    if (a == "--vector_size") {
+      if (i + 1 < args.argc) {
+        std::size_t v = 0;
+        if (parse_size_t(args.argv[++i], v)) opts.vector_size = v;
+      }
+      continue;
+    }
+
+    if (a.rfind("--vector_size=", 0) == 0) {
+      std::size_t v = 0;
+      if (parse_size_t(a.substr(std::string("--vector_size=").size()), v))
+        opts.vector_size = v;
+      continue;
+    }
+
+    if (a == "--chunk_size") {
+      if (i + 1 < args.argc) {
+        std::size_t c = 0;
+        if (parse_size_t(args.argv[++i], c)) opts.chunk_size = c;
+      }
+      continue;
+    }
+
+    if (a.rfind("--chunk_size=", 0) == 0) {
+      std::size_t c = 0;
+      if (parse_size_t(a.substr(std::string("--chunk_size=").size()), c))
+        opts.chunk_size = c;
+      continue;
+    }
+
+    // Ignore unknown options (e.g. Legion runtime flags like -ll:cpu).
+  }
+
+  return opts;
+}
+
+static void print_usage(const char* prog) {
+  std::cout << "usage: " << (prog ? prog : "heaps") << " [options]\n\n"
+            << "options:\n"
+            << "  --vector_size <int>   size of vector (default: 25)\n"
+            << "  --chunk_size <int>    amount of work per task (default: 0 => auto)\n"
+            << "  --help                print this help message\n";
+}
+
+static std::size_t floor_log2(std::size_t x) {
+  std::size_t r = 0;
+  while ((r + 1) < (sizeof(std::size_t) * 8) && ((std::size_t(1) << (r + 1)) <= x)) {
+    ++r;
+  }
+  return r;
+}
+
+static void write_heap_characteristics(const std::vector<int>& v) {
+  std::ofstream outFile("heaps.txt");
+
+  std::size_t first_count = std::min<std::size_t>(v.size(), 10);
+  outFile << "First " << first_count << " elements: ";
+  for (std::size_t i = 0; i < first_count; ++i) {
+    outFile << v[i];
+    if (i + 1 < first_count) outFile << " ";
+  }
+
+  std::size_t last_count = std::min<std::size_t>(v.size(), 10);
+  std::size_t last_start = v.size() - last_count;
+  outFile << "\nLast " << last_count << " elements: ";
+  for (std::size_t i = last_start; i < v.size(); ++i) {
+    outFile << v[i];
+    if (i + 1 < v.size()) outFile << " ";
+  }
+
+  long long sum = std::accumulate(v.begin(), v.end(), 0LL);
+  outFile << "\nSum of all elements: " << sum << "\n";
+
+  if (!v.empty()) {
+    outFile << "Root (max) element: " << v[0] << "\n";
+  }
+
+  bool is_valid_heap = std::is_heap(v.begin(), v.end());
+  outFile << "Is valid heap: " << (is_valid_heap ? "true" : "false") << "\n";
+}
+
+static void sift_down_chunk_task(const Task* task,
+                                 const std::vector<PhysicalRegion>& /*regions*/,
+                                 Context /*ctx*/,
+                                 Runtime* /*runtime*/) {
+  const auto* args = static_cast<const SiftChunkArgs*>(task->args);
+  if (args == nullptr || args->data == nullptr || args->len <= 1 || args->count == 0) return;
+
+  int* first = args->data;
+  int* last = first + args->len;
+  std::less<int> pred;
+
+  using diff_t = typename std::iterator_traits<int*>::difference_type;
+  diff_t len = static_cast<diff_t>(args->len);
+
+  for (std::size_t i = 0; i < args->count; ++i) {
+    std::size_t idx = args->start_index - i;
+    heap_legion::sift_down<int*, std::less<int>>(first, last, pred, len, first + idx);
+  }
+}
+
+static void legion_make_heap(std::vector<int>& v,
+                             std::size_t chunk_size,
+                             Context ctx,
+                             Runtime* runtime) {
+  const std::size_t n = v.size();
+  if (n <= 1) return;
+
+  const std::size_t last_internal = (n - 2) / 2;
+
+  // Process internal levels bottom-up, excluding root level (depth 0).
+  if (last_internal >= 1) {
+    const std::size_t max_depth = floor_log2(last_internal + 1);
+
+    for (std::ptrdiff_t depth = static_cast<std::ptrdiff_t>(max_depth); depth >= 1; --depth) {
+      const std::size_t d = static_cast<std::size_t>(depth);
+      const std::size_t level_left = (std::size_t(1) << d) - 1;
+      const std::size_t level_right = std::min(last_internal, (std::size_t(1) << (d + 1)) - 2);
+
+      if (level_right < level_left) continue;
+
+      const std::size_t items = level_right - level_left + 1;
+      const std::size_t local_chunk = std::max<std::size_t>(1, std::min(chunk_size, items));
+
+      std::vector<Future> futures;
+      futures.reserve((items + local_chunk - 1) / local_chunk);
+
+      std::size_t processed = 0;
+      while (processed < items) {
+        const std::size_t this_chunk = std::min(local_chunk, items - processed);
+
+        SiftChunkArgs args;
+        args.data = v.data();
+        args.len = n;
+        args.start_index = level_right - processed;
+        args.count = this_chunk;
+
+        TaskLauncher launcher(SIFT_DOWN_CHUNK_TASK_ID, TaskArgument(&args, sizeof(args)));
+        futures.emplace_back(runtime->execute_task(ctx, launcher));
+
+        processed += this_chunk;
+      }
+
+      // Barrier between levels.
+      for (Future& f : futures) {
+        f.get_void_result();
+      }
+    }
+  }
+
+  // Root node.
+  std::less<int> pred;
+  using diff_t = typename std::iterator_traits<int*>::difference_type;
+  heap_legion::sift_down<int*, std::less<int>>(v.data(), v.data() + n, pred, static_cast<diff_t>(n), v.data());
+}
+
+static void top_level_task(const Task*,
+                           const std::vector<PhysicalRegion>&,
+                           Context ctx,
+                           Runtime* runtime) {
+  InputArgs in = Runtime::get_input_args();
+  ProgramOptions opts = parse_options(in);
+
+  if (opts.help) {
+    print_usage((in.argc > 0) ? in.argv[0] : "heaps");
+    return;
+  }
+
+  std::vector<int> v(opts.vector_size);
+  std::iota(v.begin(), v.end(), 0);
+
+  std::size_t chunk_size = opts.chunk_size;
+  if (chunk_size == 0) {
+    std::size_t threads = std::max<unsigned>(1, std::thread::hardware_concurrency());
+    chunk_size = std::max<std::size_t>(1, opts.vector_size / threads);
+  }
+
+  legion_make_heap(v, chunk_size, ctx, runtime);
+  write_heap_characteristics(v);
+}
+
+int main(int argc, char* argv[]) {
+  Runtime::set_top_level_task_id(TOP_LEVEL_TASK_ID);
+
+  {
+    TaskVariantRegistrar registrar(TOP_LEVEL_TASK_ID, "top_level_task");
+    registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+    Runtime::preregister_task_variant<top_level_task>(registrar, "top_level_task");
+  }
+
+  {
+    TaskVariantRegistrar registrar(SIFT_DOWN_CHUNK_TASK_ID, "sift_down_chunk_task");
+    registrar.add_constraint(ProcessorConstraint(Processor::LOC_PROC));
+    registrar.set_leaf();
+    Runtime::preregister_task_variant<sift_down_chunk_task>(registrar, "sift_down_chunk_task");
+  }
+
+  return Runtime::start(argc, argv);
+}
+```
+
+[sift.hpp]
+```cpp
+// sift.hpp (Legion-friendly translation)
+// Sequential heap kernels used inside Legion task bodies.
+
+#pragma once
+
+#include <cstddef>
+#include <iterator>
+
+namespace heap_legion {
+
+template <typename RndIter, typename Pred>
+inline void sift_down(
+    RndIter first,
+    [[maybe_unused]] RndIter last,
+    const Pred& pred,
+    typename std::iterator_traits<RndIter>::difference_type len,
+    RndIter start)
+{
+    using difference_type =
+        typename std::iterator_traits<RndIter>::difference_type;
+    using value_type =
+        typename std::iterator_traits<RndIter>::value_type;
+
+    // left-child of start is at 2 * start + 1
+    // right-child of start is at 2 * start + 2
+    difference_type child = start - first;
+
+    if (len < 2 || (len - 2) / 2 < child)
+        return;
+
+    child = 2 * child + 1;
+    RndIter child_i = first + child;
+
+    if ((child + 1) < len && pred(*child_i, *(child_i + 1))) {
+        ++child_i;
+        ++child;
+    }
+
+    if (pred(*child_i, *start))
+        return;
+
+    value_type top = *start;
+    do {
+        *start = *child_i;
+        start = child_i;
+
+        if ((len - 2) / 2 < child)
+            break;
+
+        child = 2 * child + 1;
+        child_i = first + child;
+
+        if ((child + 1) < len && pred(*child_i, *(child_i + 1))) {
+            ++child_i;
+            ++child;
+        }
+    } while (!pred(*child_i, top));
+
+    *start = top;
+}
+
+template <typename RndIter, typename Pred>
+inline void sift_down_range(
+    RndIter first,
+    RndIter last,
+    const Pred& pred,
+    typename std::iterator_traits<RndIter>::difference_type len,
+    RndIter start,
+    std::size_t count)
+{
+    using difference_type =
+        typename std::iterator_traits<RndIter>::difference_type;
+
+    // Calls sift_down for a descending range of parents:
+    // start, start-1, ..., start-(count-1)
+    for (std::size_t i = 0; i < count; ++i) {
+        sift_down(
+            first,
+            last,
+            pred,
+            len,
+            start - static_cast<difference_type>(i));
+    }
+}
+
+} // namespace heap_legion
+```
