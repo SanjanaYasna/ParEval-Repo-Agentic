@@ -75,6 +75,8 @@ void init_task(const Task *task,
                Context ctx,
                Runtime *runtime) {
   (void)task;
+  (void)ctx;
+  (void)runtime;
   assert(regions.size() == 2);
 
   FieldAccessor<WRITE_DISCARD, int, 1> acc_used(regions[0], FID_NODE_USED);
@@ -86,11 +88,8 @@ void init_task(const Task *task,
   FieldAccessor<WRITE_DISCARD, int, 1> acc_root(regions[1], FID_META_ROOT);
   FieldAccessor<WRITE_DISCARD, int, 1> acc_next_free(regions[1], FID_META_NEXT_FREE);
 
-  Rect<1> node_rect =
-      runtime->get_index_space_domain(ctx, regions[0].get_logical_region().get_index_space());
-
-  for (PointInRectIterator<1> it(node_rect); it(); it++) {
-    const Point<1> p = *it;
+  for (int idx = 0; idx < MAX_NODES; ++idx) {
+    const Point<1> p(idx);
     acc_used[p] = 0;
     acc_key[p] = 0;
     acc_left[p] = -1;
@@ -240,7 +239,7 @@ void top_level_task(const Task * /*task*/,
 
   // Create node region
   Rect<1> node_bounds(0, MAX_NODES - 1);
-  IndexSpace node_is = runtime->create_index_space(ctx, node_bounds);
+  IndexSpace node_is = runtime->create_index_space(ctx, Domain(node_bounds));
   FieldSpace node_fs = runtime->create_field_space(ctx);
   {
     FieldAllocator alloc = runtime->create_field_allocator(ctx, node_fs);
@@ -254,7 +253,7 @@ void top_level_task(const Task * /*task*/,
 
   // Create metadata region (single element)
   Rect<1> meta_bounds(0, 0);
-  IndexSpace meta_is = runtime->create_index_space(ctx, meta_bounds);
+  IndexSpace meta_is = runtime->create_index_space(ctx, Domain(meta_bounds));
   FieldSpace meta_fs = runtime->create_field_space(ctx);
   {
     FieldAllocator alloc = runtime->create_field_allocator(ctx, meta_fs);

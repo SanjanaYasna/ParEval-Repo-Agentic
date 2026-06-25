@@ -94,7 +94,7 @@ void top_level_task(const Task *task,
 
   // Create a logical region storing one int.
   Rect<1> elem_rect(0, 0);
-  IndexSpace is = runtime->create_index_space(ctx, Domain::from_rect<1>(elem_rect));
+  IndexSpace is = runtime->create_index_space(ctx, Domain(elem_rect));
   FieldSpace fs = runtime->create_field_space(ctx);
   {
     FieldAllocator allocator = runtime->create_field_allocator(ctx, fs);
@@ -129,7 +129,7 @@ void top_level_task(const Task *task,
     launch_init(0);
 
     Rect<1> launch_rect(0, 63);
-    IndexLauncher launcher(INCREMENT_TASK_ID, Domain::from_rect<1>(launch_rect),
+    IndexLauncher launcher(INCREMENT_TASK_ID, Domain(launch_rect),
                            TaskArgument(nullptr, 0), ArgumentMap());
     launcher.add_region_requirement(RegionRequirement(lr, READ_WRITE, EXCLUSIVE, lr));
     launcher.region_requirements[0].add_field(FID_VALUE);
@@ -155,7 +155,7 @@ void top_level_task(const Task *task,
     launch_init(2);
 
     Rect<1> launch_rect(0, 3);
-    IndexLauncher launcher(SQUARE_TASK_ID, Domain::from_rect<1>(launch_rect),
+    IndexLauncher launcher(SQUARE_TASK_ID, Domain(launch_rect),
                            TaskArgument(nullptr, 0), ArgumentMap());
     launcher.add_region_requirement(RegionRequirement(lr, READ_WRITE, EXCLUSIVE, lr));
     launcher.region_requirements[0].add_field(FID_VALUE);

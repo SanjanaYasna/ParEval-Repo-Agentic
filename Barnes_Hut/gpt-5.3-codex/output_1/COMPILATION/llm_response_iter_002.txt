@@ -1,0 +1,646 @@
+[Makefile]
+```make
+# ============================================================================
+# Barnes-Hut Makefile
+# ============================================================================
+
+CXX       ?= g++
+CXXFLAGS  ?= -O2 -std=c++17 -Wall
+LDFLAGS   ?=
+LDLIBS    ?=
+TARGET    := barnes-hut
+
+SOURCES   := main.cpp
+HEADERS   := octree.hpp particle.hpp
+
+.PHONY: all clean
+
+all: $(TARGET)
+
+$(TARGET): $(SOURCES) $(HEADERS)
+	$(CXX) $(CXXFLAGS) -o $@ $(SOURCES) $(LDFLAGS) $(LDLIBS)
+
+clean:
+	rm -f $(TARGET)
+```
+
+[ReadMe.md]
+```markdown
+# Barnes-Hut Simulation using HPX
+
+More information about the Barnes-Hut Simulation can be found [here](https://en.wikipedia.org/wiki/Barnes%E2%80%93Hut_simulation).
+This implementation contains an HPX version of the simulation that provides net particle simulation statistics at each timestep.
+
+## Programs
+main.cpp
+Rank 0 computes and writes aggregate statistics to barnes_hut.txt after each timestep, and appends a final summary line with the total number of particles and timesteps. The computations are done with precision of 2. 
+
+octree.hpp
+Implements octree data structure and Barnes–Hut force.
+
+particle.hpp
+Defines particle and domain representations plus support routines. Prints out global statistics (active count, kinetic energy, total momentum, and center of mass) to be formatted into barnes_hut.txt each timestep.
+
+## Prerequisites
+
+- HPX installed (ideally 1.5.1 or 1.10.0)
+- A C++17-compliant C++ compiler (e.g. GCC, Clang) and beyond
+- `HPX_LOCATION` set to the HPX installation prefix (the directory containing `lib/`, `include/`, etc.)
+- Boost, which path is set as `BOOST_ROOT` and incorporated into `LD_LIBRARY_PATH`
+
+### Build
+
+From the repository root, run
+
+```
+make
+```
+
+If you would like to rebulid, run  ```make clean``` before running ```make``` again. 
+
+## Run
+
+The program has command-line options:
+
+--nparticles (int)
+Number of particles in the simulation. Each particle is initialized with a random position in a fixed 3D domain and equal mass.
+
+--nsteps (int)
+Number of simulation timesteps to advance. At each step the octree is rebuilt, forces are computed, and positions/velocities are updated.
+
+```
+Example Run: 
+```bash
+> ./barnes-hut --nparticles 100 --nsteps 5
+> cat barnes_hut.txt 
+Step    1 | active 100/100 | KE 9.25e+05 | |p| 5.78e+04 | CoM (49.95, 48.81, 54.59)
+Step    2 | active 100/100 | KE 3.70e+06 | |p| 1.16e+05 | CoM (49.95, 48.81, 54.59)
+Step    3 | active 100/100 | KE 8.33e+06 | |p| 1.73e+05 | CoM (49.95, 48.81, 54.59)
+Step    4 | active 100/100 | KE 1.48e+07 | |p| 2.31e+05 | CoM (49.95, 48.81, 54.59)
+Step    5 | active 100/100 | KE 2.32e+07 | |p| 2.89e+05 | CoM (49.95, 48.81, 54.59)
+Num Particles: 100 | Num Steps: 5
+```
+```
+
+[main.cpp]
+```cpp
+/* ============================================================================
+ * Barnes-Hut main
+ * ============================================================================
+ */
+#include <climits>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+
+#include "octree.hpp"
+
+constexpr double WIDTH  = 99999.0;
+constexpr double LENGTH = 99999.0;
+constexpr double HEIGHT = 99999.0;
+
+constexpr double ORIGIN_X = -99999.0;
+constexpr double ORIGIN_Y = -99999.0;
+constexpr double ORIGIN_Z = -99999.0;
+
+namespace {
+
+void print_usage()
+{
+    std::fprintf(stderr,
+        "Usage: barnes-hut [--nparticles <NUM>] [--nsteps <NUM>] [--hpx:threads=<N>]\n");
+}
+
+bool parse_int(std::string const& s, int& out)
+{
+    try {
+        std::size_t idx = 0;
+        long v = std::stol(s, &idx, 10);
+        if (idx != s.size() || v < INT_MIN || v > INT_MAX) {
+            return false;
+        }
+        out = static_cast<int>(v);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+}    // namespace
+
+int main(int argc, char* argv[])
+{
+    int npart = 100000;
+    int t_step = 20;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+
+        if (arg == "--help" || arg == "-h") {
+            print_usage();
+            return 0;
+        } else if (arg == "--nparticles") {
+            if (i + 1 >= argc || !parse_int(argv[++i], npart)) {
+                print_usage();
+                return 1;
+            }
+        } else if (arg.rfind("--nparticles=", 0) == 0) {
+            if (!parse_int(arg.substr(13), npart)) {
+                print_usage();
+                return 1;
+            }
+        } else if (arg == "--nsteps") {
+            if (i + 1 >= argc || !parse_int(argv[++i], t_step)) {
+                print_usage();
+                return 1;
+            }
+        } else if (arg.rfind("--nsteps=", 0) == 0) {
+            if (!parse_int(arg.substr(9), t_step)) {
+                print_usage();
+                return 1;
+            }
+        } else if (arg.rfind("--hpx:", 0) == 0) {
+            if (arg.find('=') == std::string::npos && i + 1 < argc && argv[i + 1][0] != '-') {
+                ++i;
+            }
+            continue;
+        } else {
+            print_usage();
+            return 1;
+        }
+    }
+
+    if (npart <= 0 || t_step <= 0) {
+        print_usage();
+        return 1;
+    }
+
+    Space space = {WIDTH, LENGTH, HEIGHT, ORIGIN_X, ORIGIN_Y, ORIGIN_Z};
+
+    {
+        std::ofstream outfile("barnes_hut.txt", std::ios::trunc);
+    }
+
+    auto* particle_array = new Particle[npart]();
+    std::srand(42);
+    generate_random_particles(particle_array, space, npart);
+
+    for (int step = 1; step <= t_step; ++step) {
+        Octree* octree = create_empty_octree(space);
+
+        for (int j = 0; j < npart; ++j) {
+            if (in_space(space, particle_array[j])) {
+                octree_insert(octree, space, &(particle_array[j]));
+            }
+        }
+
+        for (int i = 0; i < npart; ++i) {
+            particle_array[i].force_x = 0.0;
+            particle_array[i].force_y = 0.0;
+            particle_array[i].force_z = 0.0;
+        }
+
+        for (int i = 0; i < npart; ++i) {
+            if (in_space(space, particle_array[i])) {
+                compute_force(&particle_array[i], octree);
+            }
+        }
+
+        for (int i = 0; i < npart; ++i) {
+            if (in_space(space, particle_array[i])) {
+                update_particle_position_and_velocity(&particle_array[i]);
+            }
+        }
+
+        free_octree(octree);
+        print_summary(particle_array, npart, space, step, 1);
+    }
+
+    delete[] particle_array;
+
+    {
+        std::ofstream outfile("barnes_hut.txt", std::ios::app);
+        outfile << "Num Particles: " << npart << " | Num Steps: " << t_step << "\n";
+    }
+
+    return 0;
+}
+```
+
+[octree.hpp]
+```cpp
+/* ============================================================================
+ * Barnes-Hut Octree
+ * Original: https://github.com/Jrokisky/MPI-Barnes-hut, restructured
+ * Author:   Justin Rokisky
+ * ============================================================================ */
+#pragma once
+
+#include <cmath>
+#include <cstddef>
+
+#include "particle.hpp"
+
+struct Octree {
+    Octree* children[8];
+    Particle* value;
+    double total_mass;
+    double com_x, com_y, com_z;
+    double box_size;
+    int num_leaves;
+    Space space;
+};
+
+Octree* create_empty_octree(Space space);
+void octree_insert(Octree* octree, Space space, Particle* p);
+void update_center_of_mass(Octree* octree, Particle* p);
+void compute_force(Particle* leaf, Octree* octree);
+void free_octree(Octree* octree);
+
+constexpr double THETA = 1.0;
+constexpr double GRAVITY = 4.30091e-3;
+
+struct ForceContribution {
+    double fx{0.0};
+    double fy{0.0};
+    double fz{0.0};
+};
+
+inline Octree* create_empty_octree(Space space)
+{
+    auto* octree = new Octree();
+    for (int i = 0; i < 8; i++) {
+        octree->children[i] = nullptr;
+    }
+    octree->value = nullptr;
+    octree->total_mass = 0.0;
+    octree->com_x = 0.0;
+    octree->com_y = 0.0;
+    octree->com_z = 0.0;
+    octree->box_size = space.boundary_x - space.origin_x;
+    octree->num_leaves = 0;
+    octree->space = space;
+    return octree;
+}
+
+inline void octree_insert(Octree* octree, Space space, Particle* p)
+{
+    bool done = false;
+
+    while (!done) {
+        update_center_of_mass(octree, p);
+
+        bool has_children = false;
+        for (int i = 0; i < 8; i++) {
+            if (octree->children[i] != nullptr) {
+                has_children = true;
+                break;
+            }
+        }
+
+        Space sub_spaces[8];
+        double mid_x = (space.origin_x + space.boundary_x) / 2.0;
+        double mid_y = (space.origin_y + space.boundary_y) / 2.0;
+        double mid_z = (space.origin_z + space.boundary_z) / 2.0;
+
+        for (int i = 0; i < 8; i++) {
+            bool gt_mid_x = i & (1 << 0);
+            bool gt_mid_y = i & (1 << 1);
+            bool gt_mid_z = i & (1 << 2);
+
+            sub_spaces[i].boundary_x = gt_mid_x ? space.boundary_x : mid_x;
+            sub_spaces[i].origin_x = gt_mid_x ? mid_x : space.origin_x;
+            sub_spaces[i].boundary_y = gt_mid_y ? space.boundary_y : mid_y;
+            sub_spaces[i].origin_y = gt_mid_y ? mid_y : space.origin_y;
+            sub_spaces[i].boundary_z = gt_mid_z ? space.boundary_z : mid_z;
+            sub_spaces[i].origin_z = gt_mid_z ? mid_z : space.origin_z;
+        }
+
+        if (octree->value != nullptr) {
+            Particle* curr_child = octree->value;
+            octree->value = nullptr;
+
+            int curr_child_octant = get_octant(*curr_child, space);
+            if (octree->children[curr_child_octant] == nullptr) {
+                Octree* new_child = create_empty_octree(sub_spaces[curr_child_octant]);
+                octree->children[curr_child_octant] = new_child;
+                update_center_of_mass(new_child, curr_child);
+            }
+            octree->children[curr_child_octant]->value = curr_child;
+
+            int p_octant = get_octant(*p, space);
+
+            if (p_octant != curr_child_octant) {
+                Octree* new_child = create_empty_octree(sub_spaces[p_octant]);
+                octree->children[p_octant] = new_child;
+                update_center_of_mass(new_child, p);
+                new_child->value = p;
+                done = true;
+            } else {
+                space = sub_spaces[p_octant];
+                octree = octree->children[p_octant];
+            }
+        } else if (has_children) {
+            int p_octant = get_octant(*p, space);
+            if (octree->children[p_octant] == nullptr) {
+                octree->children[p_octant] = create_empty_octree(sub_spaces[p_octant]);
+            }
+            space = sub_spaces[p_octant];
+            octree = octree->children[p_octant];
+        } else {
+            octree->value = p;
+            done = true;
+        }
+    }
+}
+
+inline void update_center_of_mass(Octree* octree, Particle* p)
+{
+    double total_mass = octree->total_mass + p->mass;
+    octree->com_x =
+        clamp(clamp(octree->total_mass * octree->com_x) + clamp(p->x * p->mass)) / total_mass;
+    octree->com_y =
+        clamp(clamp(octree->total_mass * octree->com_y) + clamp(p->y * p->mass)) / total_mass;
+    octree->com_z =
+        clamp(clamp(octree->total_mass * octree->com_z) + clamp(p->z * p->mass)) / total_mass;
+    octree->total_mass = total_mass;
+}
+
+inline ForceContribution compute_force_accum(Particle const* leaf, Octree const* octree)
+{
+    ForceContribution out{};
+
+    if (octree == nullptr || leaf == nullptr) {
+        return out;
+    }
+
+    if (octree->value != nullptr) {
+        Particle const* l = octree->value;
+        if (l == leaf) {
+            return out;
+        }
+
+        double distance = clamp(compute_distance(leaf, l->x, l->y, l->z));
+        double denom = clamp(std::pow(distance, 3.0));
+
+        out.fx += clamp(GRAVITY * leaf->mass * l->mass * clamp((l->x - leaf->x) / denom));
+        out.fy += clamp(GRAVITY * leaf->mass * l->mass * clamp((l->y - leaf->y) / denom));
+        out.fz += clamp(GRAVITY * leaf->mass * l->mass * clamp((l->z - leaf->z) / denom));
+        return out;
+    }
+
+    double distance = clamp(compute_distance(leaf, octree->com_x, octree->com_y, octree->com_z));
+
+    if ((octree->box_size / distance) < THETA) {
+        double denom = clamp(std::pow(distance, 3.0));
+        out.fx += clamp(
+            GRAVITY * leaf->mass * octree->total_mass * clamp((octree->com_x - leaf->x) / denom));
+        out.fy += clamp(
+            GRAVITY * leaf->mass * octree->total_mass * clamp((octree->com_y - leaf->y) / denom));
+        out.fz += clamp(
+            GRAVITY * leaf->mass * octree->total_mass * clamp((octree->com_z - leaf->z) / denom));
+        return out;
+    }
+
+    for (int i = 0; i < 8; i++) {
+        Octree const* child = octree->children[i];
+        if (child != nullptr) {
+            ForceContribution part = compute_force_accum(leaf, child);
+            out.fx += part.fx;
+            out.fy += part.fy;
+            out.fz += part.fz;
+        }
+    }
+
+    return out;
+}
+
+inline void compute_force(Particle* leaf, Octree* octree)
+{
+    ForceContribution total = compute_force_accum(leaf, octree);
+    leaf->force_x += total.fx;
+    leaf->force_y += total.fy;
+    leaf->force_z += total.fz;
+}
+
+inline void free_octree_impl(Octree* octree)
+{
+    if (octree == nullptr) {
+        return;
+    }
+
+    for (int i = 0; i < 8; i++) {
+        if (octree->children[i] != nullptr) {
+            free_octree_impl(octree->children[i]);
+        }
+    }
+
+    delete octree;
+}
+
+inline void free_octree(Octree* octree)
+{
+    free_octree_impl(octree);
+}
+```
+
+[particle.hpp]
+```cpp
+/* ============================================================================
+ * Barnes-Hut utilities
+ * Translated from MPI-oriented codebase to standalone utilities.
+ * ============================================================================ */
+#pragma once
+
+#include <cfloat>
+#include <climits>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
+
+struct Particle {
+    int id;
+    double x, y, z;
+    double vel_x, vel_y, vel_z;
+    double force_x, force_y, force_z;
+    double mass;
+
+    template <typename Archive>
+    void serialize(Archive& ar, const unsigned int /*version*/)
+    {
+        ar& id& x& y& z& vel_x& vel_y& vel_z& force_x& force_y& force_z& mass;
+    }
+};
+
+struct Space {
+    double boundary_x, boundary_y, boundary_z;
+    double origin_x, origin_y, origin_z;
+
+    template <typename Archive>
+    void serialize(Archive& ar, const unsigned int /*version*/)
+    {
+        ar& boundary_x& boundary_y& boundary_z& origin_x& origin_y& origin_z;
+    }
+};
+
+// Forward declarations from octree.hpp
+struct Octree;
+
+double drand_custom(double low, double high);
+double clamp(double in);
+int get_octant(Particle particle, Space space);
+void generate_random_particles(Particle* p, Space s, int count);
+void print_summary(Particle* particles, int npart, Space space, int timestep, int nprocs);
+double compute_distance(Particle const* particle, double com_x, double com_y, double com_z);
+void update_particle_position_and_velocity(Particle* p);
+bool in_space(Space s, Particle p);
+void update_center_of_mass(Octree* octree, Particle* p);
+void compute_force(Particle* leaf, Octree* octree);
+
+inline double drand_custom(double low, double high)
+{
+    double range = high - low;
+    return (static_cast<double>(std::rand()) * range) / static_cast<double>(RAND_MAX) + low;
+}
+
+inline double clamp(double in)
+{
+    if (in >= 0.0) {
+        double tmp = in < DBL_MIN ? DBL_MIN : in;
+        return tmp > DBL_MAX ? DBL_MAX : tmp;
+    } else {
+        double tmp = in < -DBL_MAX ? -DBL_MAX : in;
+        return tmp > -DBL_MIN ? -DBL_MIN : tmp;
+    }
+}
+
+inline int get_octant(Particle particle, Space space)
+{
+    int octant = 0;
+    if (particle.x > ((space.origin_x + space.boundary_x) / 2.0)) {
+        octant |= (1 << 0);
+    }
+
+    if (particle.y > ((space.origin_y + space.boundary_y) / 2.0)) {
+        octant |= (1 << 1);
+    }
+
+    if (particle.z > ((space.origin_z + space.boundary_z) / 2.0)) {
+        octant |= (1 << 2);
+    }
+
+    return octant;
+}
+
+inline void generate_random_particles(Particle* p, Space space, int count)
+{
+    (void) space;
+
+    for (int i = 0; i < count; i++) {
+        p[i].x = drand_custom(0.0, 100.0);
+        p[i].y = drand_custom(0.0, 100.0);
+        p[i].z = drand_custom(0.0, 100.0);
+        p[i].vel_x = 0.0;
+        p[i].vel_y = 0.0;
+        p[i].vel_z = 0.0;
+        p[i].force_x = 0.0;
+        p[i].force_y = 0.0;
+        p[i].force_z = 0.0;
+        p[i].mass = 1000000.0;
+        p[i].id = i;
+    }
+}
+
+inline void print_summary(Particle* particles, int npart, Space space, int timestep, int nprocs)
+{
+    (void) nprocs;
+
+    struct SummaryData {
+        double total_ke = 0.0;
+        double total_px = 0.0;
+        double total_py = 0.0;
+        double total_pz = 0.0;
+        double com_x = 0.0;
+        double com_y = 0.0;
+        double com_z = 0.0;
+        double total_mass = 0.0;
+        int active = 0;
+    };
+
+    SummaryData stats;
+
+    for (int i = 0; i < npart; ++i) {
+        Particle const& p = particles[i];
+        if (!in_space(space, p)) {
+            continue;
+        }
+
+        stats.active += 1;
+
+        double v2 = p.vel_x * p.vel_x + p.vel_y * p.vel_y + p.vel_z * p.vel_z;
+        stats.total_ke += 0.5 * p.mass * v2;
+        stats.total_px += p.mass * p.vel_x;
+        stats.total_py += p.mass * p.vel_y;
+        stats.total_pz += p.mass * p.vel_z;
+        stats.com_x += p.mass * p.x;
+        stats.com_y += p.mass * p.y;
+        stats.com_z += p.mass * p.z;
+        stats.total_mass += p.mass;
+    }
+
+    double com_x = 0.0;
+    double com_y = 0.0;
+    double com_z = 0.0;
+
+    if (stats.total_mass > 0.0) {
+        com_x = stats.com_x / stats.total_mass;
+        com_y = stats.com_y / stats.total_mass;
+        com_z = stats.com_z / stats.total_mass;
+    }
+
+    double total_p = std::sqrt(stats.total_px * stats.total_px + stats.total_py * stats.total_py +
+        stats.total_pz * stats.total_pz);
+
+    std::ofstream outfile("barnes_hut.txt", std::ios::app);
+    outfile << "Step " << timestep << " | active " << stats.active << "/" << npart
+            << " | KE " << std::scientific << std::setprecision(2) << stats.total_ke
+            << " | |p| " << std::scientific << std::setprecision(2) << total_p
+            << " | CoM (" << std::fixed << std::setprecision(2) << com_x << ", " << com_y << ", "
+            << com_z << ")\n";
+}
+
+inline double compute_distance(Particle const* particle, double com_x, double com_y, double com_z)
+{
+    return std::sqrt(clamp(std::pow(particle->x - com_x, 2)) +
+        clamp(std::pow(particle->y - com_y, 2)) + clamp(std::pow(particle->z - com_z, 2)));
+}
+
+inline void update_particle_position_and_velocity(Particle* p)
+{
+    double dt = 0.001;
+    double acc_x = clamp(p->force_x / p->mass);
+    double acc_y = clamp(p->force_y / p->mass);
+    double acc_z = clamp(p->force_z / p->mass);
+
+    double v_mid_x = p->vel_x + clamp(0.5 * dt * acc_x);
+    double v_mid_y = p->vel_y + clamp(0.5 * dt * acc_y);
+    double v_mid_z = p->vel_z + clamp(0.5 * dt * acc_z);
+
+    p->x = p->x + clamp(dt * v_mid_x);
+    p->y = p->y + clamp(dt * v_mid_y);
+    p->z = p->z + clamp(dt * v_mid_z);
+
+    p->vel_x = v_mid_x + clamp(0.5 * dt * acc_x);
+    p->vel_y = v_mid_y + clamp(0.5 * dt * acc_y);
+    p->vel_z = v_mid_z + clamp(0.5 * dt * acc_z);
+}
+
+inline bool in_space(Space s, Particle p)
+{
+    return (p.x > s.origin_x) && (p.x < s.boundary_x) && (p.y > s.origin_y) &&
+        (p.y < s.boundary_y) && (p.z > s.origin_z) && (p.z < s.boundary_z);
+}
+```

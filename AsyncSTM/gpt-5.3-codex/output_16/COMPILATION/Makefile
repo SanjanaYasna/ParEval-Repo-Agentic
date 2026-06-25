@@ -1,37 +1,38 @@
 CXX ?= g++
 
-# Allow LEGION_DIR, LEGION_ROOT, or common system install paths.
+# Accept either:
+#  - LEGION_DIR=<install-prefix>/lib/cmake/Legion
+#  - LEGION_ROOT=<install-prefix>
 ifeq ($(strip $(LEGION_DIR)),)
-  ifneq ($(strip $(LEGION_ROOT)),)
-    LEGION_PREFIX := $(abspath $(LEGION_ROOT))
-    LEGION_DIR := $(LEGION_PREFIX)/lib/cmake/Legion
-  else ifneq ($(wildcard /usr/local/lib/cmake/Legion),)
-    LEGION_DIR := /usr/local/lib/cmake/Legion
-    LEGION_PREFIX := /usr/local
-  else ifneq ($(wildcard /usr/lib/cmake/Legion),)
-    LEGION_DIR := /usr/lib/cmake/Legion
-    LEGION_PREFIX := /usr
+  ifeq ($(strip $(LEGION_ROOT)),)
+    LEGION_PREFIX := $(strip $(shell pkg-config --variable=prefix legion 2>/dev/null))
   else
-    $(warning LEGION_DIR/LEGION_ROOT not set; relying on compiler/linker default search paths for Legion)
-    LEGION_PREFIX :=
+    LEGION_PREFIX := $(abspath $(LEGION_ROOT))
   endif
 else
   LEGION_PREFIX := $(abspath $(LEGION_DIR)/../../..)
 endif
 
-# Legion include/link flags (default mapper; no custom mapper sources)
-ifneq ($(strip $(LEGION_PREFIX)),)
-LEGION_INCLUDE := -I$(LEGION_PREFIX)/include
-LEGION_LIBDIR  := -L$(LEGION_PREFIX)/lib -L$(LEGION_PREFIX)/lib64 \
-                  -Wl,-rpath,$(LEGION_PREFIX)/lib -Wl,-rpath,$(LEGION_PREFIX)/lib64
-else
-LEGION_INCLUDE :=
-LEGION_LIBDIR  :=
+ifeq ($(strip $(LEGION_PREFIX)),)
+$(error Could not determine Legion installation. Please set LEGION_DIR=<legion-install>/lib/cmake/Legion or LEGION_ROOT=<legion-install>)
 endif
+
+# Prefer lib, fall back to lib64 when needed.
+ifneq ("$(wildcard $(LEGION_PREFIX)/lib)","")
+LEGION_LIB_PATH := $(LEGION_PREFIX)/lib
+else ifneq ("$(wildcard $(LEGION_PREFIX)/lib64)","")
+LEGION_LIB_PATH := $(LEGION_PREFIX)/lib64
+else
+LEGION_LIB_PATH := $(LEGION_PREFIX)/lib
+endif
+
+# Legion include/link flags (default mapper; no custom mapper sources)
+LEGION_INCLUDE := -I$(LEGION_PREFIX)/include
+LEGION_LIBDIR  := -L$(LEGION_LIB_PATH) -Wl,-rpath,$(LEGION_LIB_PATH)
 LEGION_LIBS    := -llegion -lrealm -lrt -lpthread -ldl -lz
 
 # Boost paths (optional)
-ifneq ($(strip $(BOOST_ROOT)),)
+ifdef BOOST_ROOT
 BOOST_INCLUDE := -I$(BOOST_ROOT)/include
 BOOST_LIB     := -L$(BOOST_ROOT)/lib -Wl,-rpath,$(BOOST_ROOT)/lib
 else

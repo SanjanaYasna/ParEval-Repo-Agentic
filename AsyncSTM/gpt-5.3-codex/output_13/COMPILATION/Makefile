@@ -1,53 +1,56 @@
 CXX ?= g++
 
-# Try to discover Legion flags via CMake package discovery. If LEGION_DIR is
-# not set, fall back to default CMake search paths, then pkg-config, then -llegion.
-CMAKE_FIND_PACKAGE_BASE = cmake --find-package -DNAME=Legion -DCOMPILER_ID=GNU -DLANGUAGE=CXX
-ifdef LEGION_DIR
-CMAKE_PREFIX_ARG = -DCMAKE_PREFIX_PATH="$(LEGION_DIR)"
+# Query Legion compile/link flags via CMake package discovery.
+# If LEGION_DIR is not set, try default CMake search paths.
+ifeq ($(strip $(LEGION_DIR)),)
+LEGION_CFLAGS_RAW := $(shell if command -v cmake >/dev/null 2>&1; then cmake --find-package -DNAME=Legion -DCOMPILER_ID=GNU -DLANGUAGE=CXX -DMODE=COMPILE 2>/dev/null; fi)
+LEGION_LIBS_RAW   := $(shell if command -v cmake >/dev/null 2>&1; then cmake --find-package -DNAME=Legion -DCOMPILER_ID=GNU -DLANGUAGE=CXX -DMODE=LINK    2>/dev/null; fi)
 else
-CMAKE_PREFIX_ARG =
+LEGION_CFLAGS_RAW := $(shell if command -v cmake >/dev/null 2>&1; then cmake --find-package -DNAME=Legion -DCOMPILER_ID=GNU -DLANGUAGE=CXX -DMODE=COMPILE -DCMAKE_PREFIX_PATH="$(LEGION_DIR)" 2>/dev/null; fi)
+LEGION_LIBS_RAW   := $(shell if command -v cmake >/dev/null 2>&1; then cmake --find-package -DNAME=Legion -DCOMPILER_ID=GNU -DLANGUAGE=CXX -DMODE=LINK    -DCMAKE_PREFIX_PATH="$(LEGION_DIR)" 2>/dev/null; fi)
 endif
 
-LEGION_CFLAGS := $(strip $(shell $(CMAKE_FIND_PACKAGE_BASE) -DMODE=COMPILE $(CMAKE_PREFIX_ARG) 2>/dev/null || true))
-LEGION_LIBS   := $(strip $(shell $(CMAKE_FIND_PACKAGE_BASE) -DMODE=LINK    $(CMAKE_PREFIX_ARG) 2>/dev/null || true))
+LEGION_CFLAGS := $(strip $(subst ;, ,$(LEGION_CFLAGS_RAW)))
+LEGION_LIBS   := $(strip $(subst ;, ,$(LEGION_LIBS_RAW)))
 
-ifeq ($(LEGION_CFLAGS),)
-LEGION_CFLAGS := $(strip $(shell pkg-config --cflags legion 2>/dev/null || true))
-endif
-ifeq ($(LEGION_LIBS),)
-LEGION_LIBS := $(strip $(shell pkg-config --libs legion 2>/dev/null || true))
-endif
-ifeq ($(LEGION_LIBS),)
-LEGION_LIBS := -llegion
+# Fallback to pkg-config if CMake discovery was unavailable.
+ifeq ($(strip $(LEGION_CFLAGS)$(LEGION_LIBS)),)
+LEGION_CFLAGS := $(shell if command -v pkg-config >/dev/null 2>&1; then pkg-config --cflags legion 2>/dev/null; fi)
+LEGION_LIBS   := $(shell if command -v pkg-config >/dev/null 2>&1; then pkg-config --libs legion 2>/dev/null; fi)
 endif
 
+ifeq ($(strip $(LEGION_CFLAGS)$(LEGION_LIBS)),)
+$(warning Could not auto-detect Legion compile/link flags; relying on default compiler/linker search paths)
+endif
+
+# Include Boost paths only if BOOST_ROOT is provided.
+BOOST_INCLUDE :=
+BOOST_LIB :=
 ifdef BOOST_ROOT
 BOOST_INCLUDE := -I$(BOOST_ROOT)/include
 BOOST_LIB     := -L$(BOOST_ROOT)/lib -Wl,-rpath,$(BOOST_ROOT)/lib
-else
-BOOST_INCLUDE :=
-BOOST_LIB     :=
 endif
 
-CXXFLAGS += -std=c++17 -I. -g -DASTM_LEGION $(LEGION_CFLAGS) $(BOOST_INCLUDE)
-LDFLAGS  += $(LEGION_LIBS) $(BOOST_LIB)
+CXXFLAGS += -std=c++17 -I. -g -pthread -DASTM_LEGION $(LEGION_CFLAGS) $(BOOST_INCLUDE)
+LDFLAGS  += -pthread $(LEGION_LIBS) $(BOOST_LIB)
 
 ADDITIONAL_SOURCES :=
 PROGRAMS := binary_tree unit_tests concurrency_tests
-DIRECTORIES := build
+BUILD_DIR := build
+PROGRAM_TARGETS := $(addprefix $(BUILD_DIR)/,$(PROGRAMS))
 
-all: directories $(PROGRAMS)
+all: directories $(PROGRAM_TARGETS)
 
-.PHONY: all clean directories
-directories: $(DIRECTORIES)/
+.PHONY: all clean directories $(PROGRAMS)
 
-$(DIRECTORIES)/:
-	mkdir -p $@
+directories:
+	mkdir -p $(BUILD_DIR)
 
-%: %.cpp | directories
-	$(CXX) $(CXXFLAGS) $(ADDITIONAL_SOURCES) $< -o build/$@ $(LDFLAGS)
-	cp build/$@ $@
+$(PROGRAMS): %: $(BUILD_DIR)/%
+	@true
+
+$(BUILD_DIR)/%: %.cpp | directories
+	$(CXX) $(CXXFLAGS) $(ADDITIONAL_SOURCES) $< -o $@ $(LDFLAGS)
 
 clean:
-	rm -rf $(DIRECTORIES) $(PROGRAMS)
+	rm -rf $(BUILD_DIR)

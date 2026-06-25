@@ -1,0 +1,20 @@
+{
+  "iteration": 1,
+  "input_tokens": 8369,
+  "output_tokens": 14712,
+  "request_count": 1,
+  "generation_time_s": 187.653,
+  "build_status": false,
+  "run_status": false,
+  "overall_status": "BUILD_FAIL",
+  "per_file_status": {
+    "barnes_hut.txt": "BUILD_FAIL"
+  },
+  "build_dictionary": {
+    "build_returncode": 2,
+    "build_stdout": "hpxcxx -O2 -std=c++17 -Wall  -o barnes-hut main.cpp -lm \n",
+    "build_stderr": "make: hpxcxx: No such file or directory\nmake: *** [Makefile:25: barnes-hut] Error 127\n"
+  },
+  "run_dictionary": null,
+  "output_files_content": {}
+}

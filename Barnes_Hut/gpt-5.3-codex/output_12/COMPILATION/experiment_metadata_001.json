@@ -1,0 +1,20 @@
+{
+  "iteration": 1,
+  "input_tokens": 8630,
+  "output_tokens": 12971,
+  "request_count": 1,
+  "generation_time_s": 172.818,
+  "build_status": false,
+  "run_status": false,
+  "overall_status": "BUILD_FAIL",
+  "per_file_status": {
+    "barnes_hut.txt": "BUILD_FAIL"
+  },
+  "build_dictionary": {
+    "build_returncode": 2,
+    "build_stdout": "g++ -O2 -std=c++17 -Wall  -o barnes-hut main.cpp  -lm\n",
+    "build_stderr": "main.cpp:12:10: fatal error: hpx/hpx_init.hpp: No such file or directory\n   12 | #include <hpx/hpx_init.hpp>\n      |          ^~~~~~~~~~~~~~~~~~\ncompilation terminated.\nmake: *** [Makefile:21: barnes-hut] Error 1\n"
+  },
+  "run_dictionary": null,
+  "output_files_content": {}
+}

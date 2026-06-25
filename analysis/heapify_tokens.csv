@@ -1,0 +1,5 @@
+app,llm_name,iteration,n_outputs,total_input_tokens,total_output_tokens,total_generation_time_s,mean_input_tokens,mean_output_tokens
+heapify,gpt-5.3-codex,1,13,653179,955227,13577.604,50244.53846153846,73479.0
+heapify,gpt-5.3-codex,2,3,216778,325662,4639.08,72259.33333333333,108554.0
+heapify,opus,1,10,419504,815414,14720.706,41950.4,81541.4
+heapify,opus,2,5,258059,500233,9062.251,51611.8,100046.6

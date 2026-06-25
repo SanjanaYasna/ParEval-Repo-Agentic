@@ -1,5 +1,5 @@
 app,llm_name,iteration,n_outputs,total_input_tokens,total_output_tokens,total_generation_time_s,mean_input_tokens,mean_output_tokens
-AsyncSTM,gpt-5.3-codex,1,19,212717,242133,3536.464,11195.631578947368,12743.842105263158
-AsyncSTM,gpt-5.3-codex,2,17,379633,409291,5698.515,22331.352941176472,24075.941176470587
+AsyncSTM,gpt-5.3-codex,1,20,293649,268986,3827.009,14682.45,13449.3
+AsyncSTM,gpt-5.3-codex,2,20,515724,491838,6670.624,25786.2,24591.9
 AsyncSTM,opus,1,20,370526,347483,12597.148,18526.3,17374.15
 AsyncSTM,opus,2,20,738376,738786,22004.003,36918.8,36939.3

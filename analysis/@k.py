@@ -14,6 +14,10 @@ for iteration 2 is reduced accordingly.
 Usage:
     python @k.py /path/to/optimize_output_root -o metrics.csv
     python @k.py /path/to/root --k 1 3 5 10 --group-by app llm_name
+    
+    
+EXAMPLE COMMAND:
+python \@k.py ../Barnes_Hut/ --k 1 3 5 10 --group-by app llm_name -o Barnes_Hut 
 """
 
 import argparse
@@ -207,7 +211,7 @@ def gather_entries(root_dir: str) -> List[Dict[str, Any]]:
                     "input_tokens": data.get("input_tokens", 0),
                     "output_tokens": data.get("output_tokens", 0),
                     "generation_time_s": data.get("generation_time_s", 0),
-                    "has_scaling": "scaling" in data,
+                    "fchas_scaling": "scaling" in data,
                     **flags,
                 }
                 entries.append(entry)
