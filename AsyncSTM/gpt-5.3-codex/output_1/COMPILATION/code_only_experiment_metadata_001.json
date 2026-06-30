@@ -1,0 +1,22 @@
+{
+  "iteration": 1,
+  "input_tokens": 10589,
+  "output_tokens": 12339,
+  "request_count": 1,
+  "generation_time_s": 187.958,
+  "build_status": null,
+  "run_status": null,
+  "overall_status": {
+    "binary_tree.txt": "INCORRECT_MODEL",
+    "concurrency_tests.txt": "INCORRECT_MODEL",
+    "unit_tests.txt": "INCORRECT_MODEL"
+  },
+  "per_file_status": {
+    "binary_tree.txt": "INCORRECT_MODEL",
+    "concurrency_tests.txt": "INCORRECT_MODEL",
+    "unit_tests.txt": "INCORRECT_MODEL"
+  },
+  "build_dictionary": null,
+  "run_dictionary": null,
+  "output_files_content": {}
+}

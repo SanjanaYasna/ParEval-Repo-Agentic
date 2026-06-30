@@ -36,6 +36,7 @@ from math import comb
 
 ALL_STATUSES = [
     "PARSE_FAIL",
+    "INCORRECT_MODEL",
     "BUILD_FAIL",
     "RUNTIME_FAIL",
     "MISSING",

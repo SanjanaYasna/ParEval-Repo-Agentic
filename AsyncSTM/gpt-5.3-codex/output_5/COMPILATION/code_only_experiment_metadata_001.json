@@ -1,0 +1,22 @@
+{
+  "iteration": 1,
+  "input_tokens": 9522,
+  "output_tokens": 14654,
+  "request_count": 1,
+  "generation_time_s": 203.693,
+  "build_status": false,
+  "run_status": false,
+  "overall_status": "BUILD_FAIL",
+  "per_file_status": {
+    "binary_tree.txt": "BUILD_FAIL",
+    "concurrency_tests.txt": "BUILD_FAIL",
+    "unit_tests.txt": "BUILD_FAIL"
+  },
+  "build_dictionary": {
+    "build_returncode": 2,
+    "build_stdout": "mkdir -p build/\ng++ -std=c++17 -I. -g -DASTM_LEGION -I/Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/include -I/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/include  binary_tree.cpp -o build/binary_tree -L/Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/lib -Wl,-rpath,/Users/robsonlab/Teetly/legion-legion-25.06.0/install_scigrid/lib -llegion -lrealm -L/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/lib -Wl,-rpath,/Users/robsonlab/Teetly/hpx/boost_1_64_0/install/lib -lz -lpthread -ldl\n",
+    "build_stderr": "In file included from binary_tree.cpp:17:\nastm.hpp: In function \u2018Legion::Future astm::detail::launch_continuation(std::function<void(astm::transaction*)>, astm::transaction*, const Legion::Future&)\u2019:\nastm.hpp:158:18: error: \u2018struct Legion::TaskLauncher\u2019 has no member named \u2018map_locally\u2019\n  158 |         launcher.map_locally = true;\n      |                  ^~~~~~~~~~~\nmake: *** [Makefile:28: binary_tree] Error 1\n"
+  },
+  "run_dictionary": null,
+  "output_files_content": {}
+}
